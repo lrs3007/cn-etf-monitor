@@ -1,0 +1,117 @@
+import secrets
+from contextlib import asynccontextmanager
+import os
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.gzip import GZipMiddleware
+from sqlalchemy import select
+
+from .config import HORIZONS, INDEX_MAP, INDICES, now_iso
+from .db import SessionLocal
+from .models import Assessment, Bar, Evaluation, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot
+from .pipeline import seed
+
+
+@asynccontextmanager
+async def lifespan(app):
+    seed()
+    yield
+
+
+app = FastAPI(title="宽基研究台 API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+def snapshot_for(session, code, snapshot_id=None):
+    if code not in INDEX_MAP:
+        raise HTTPException(404, "未知指数")
+    market = session.get(MarketIndex, code)
+    target = snapshot_id or (market.active_snapshot if market else None)
+    snapshot = session.get(Snapshot, target) if target else None
+    if not snapshot or snapshot.index_code != code or snapshot.status != "published":
+        raise HTTPException(404, "该指数尚未完成数据回填，请运行 backfill 命令")
+    return snapshot
+
+
+def validate_horizon(horizon):
+    if horizon not in HORIZONS:
+        raise HTTPException(422, "预测期限应为1、5、10、20、60交易日")
+
+
+@app.get("/api/v1/health")
+def health():
+    return {"status": "ok", "time": now_iso()}
+
+
+@app.get("/api/v1/indices")
+def indices():
+    with SessionLocal() as session:
+        result = []
+        for spec in INDICES:
+            market = session.get(MarketIndex, spec.code)
+            snapshot = session.get(Snapshot, market.active_snapshot) if market and market.active_snapshot else None
+            result.append({"code": spec.code, "name": spec.name, "short_name": spec.short_name,
+                "description": spec.description, "ready": snapshot is not None,
+                "coverage": snapshot.coverage if snapshot else None})
+        return result
+
+
+@app.get("/api/v1/dashboard/{code}")
+def dashboard(code: str, horizon: int = 20):
+    validate_horizon(horizon)
+    with SessionLocal() as session:
+        snapshot = snapshot_for(session, code)
+        assessment = session.get(Assessment, (snapshot.id, horizon))
+        evaluations = session.scalars(select(Evaluation).where(Evaluation.snapshot_id == snapshot.id, Evaluation.horizon == horizon)).all()
+        bars = session.scalars(select(Bar).where(Bar.snapshot_id == snapshot.id).order_by(Bar.trade_date)).all()
+        return {"code": code, "snapshot_id": snapshot.id, "updated_at": snapshot.created_at,
+            "coverage": snapshot.coverage, "assessment": assessment.result,
+            "factors": [{**snapshot.coverage["factor_definitions"][item.factor_id],
+                "coverage": snapshot.coverage["factor_coverage"][item.factor_id], "evaluation": item.result}
+                for item in evaluations],
+            "prices": [{"date": b.trade_date, "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+                "volume": b.volume, "amount": b.amount, "history_type": b.history_type} for b in bars]}
+
+
+@app.get("/api/v1/indices/{code}/factors/{factor_id}")
+def factor_detail(code: str, factor_id: str, horizon: int = 20, snapshot_id: str | None = None):
+    validate_horizon(horizon)
+    with SessionLocal() as session:
+        snapshot = snapshot_for(session, code, snapshot_id)
+        if factor_id not in snapshot.coverage["factor_definitions"]:
+            raise HTTPException(404, "未知因子")
+        evaluation = session.get(Evaluation, (snapshot.id, factor_id, horizon))
+        values = session.scalars(select(FactorValue).where(FactorValue.snapshot_id == snapshot.id,
+            FactorValue.factor_id == factor_id).order_by(FactorValue.trade_date)).all()
+        returns = {r.trade_date: r.value for r in session.scalars(select(ForwardReturn).where(
+            ForwardReturn.snapshot_id == snapshot.id, ForwardReturn.horizon == horizon)).all()}
+        rolling = session.scalars(select(RollingEvaluation).where(RollingEvaluation.snapshot_id == snapshot.id,
+            RollingEvaluation.factor_id == factor_id, RollingEvaluation.horizon == horizon).order_by(RollingEvaluation.as_of)).all()
+        return {"snapshot_id": snapshot.id, "definition": snapshot.coverage["factor_definitions"][factor_id],
+            "coverage": snapshot.coverage["factor_coverage"][factor_id], "evaluation": evaluation.result,
+            "series": [{"date": v.trade_date, "value": v.value, "status": v.status,
+                "forward_return": returns.get(v.trade_date)} for v in values],
+            "rolling": [{"date": r.as_of, "ic": r.ic, "samples": r.sample_count} for r in rolling]}
+
+
+@app.get("/api/v1/data-status")
+def coverage_report():
+    with SessionLocal() as session:
+        jobs = session.scalars(select(JobRun).order_by(JobRun.started_at.desc()).limit(10)).all()
+    return {"indices": indices(), "jobs": [{"id": j.id, "status": j.status, "started_at": j.started_at,
+        "finished_at": j.finished_at, "details": j.details} for j in jobs]}
+
+
+def require_admin(authorization: str | None = Header(default=None)):
+    token = os.getenv("ADMIN_TOKEN", "")
+    if not token:
+        raise HTTPException(503, "未启用远程管理；请在本机使用CLI")
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {token}"):
+        raise HTTPException(401, "管理认证失败")
+
+
+@app.get("/api/v1/admin/config", dependencies=[Depends(require_admin)])
+def admin_config():
+    # Never return credentials, even to authenticated callers.
+    return {"tushare_configured": bool(os.getenv("TUSHARE_TOKEN")), "remote_updates": False,
+        "update_command": "python -m backend.app.cli update"}

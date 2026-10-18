@@ -1,0 +1,3 @@
+-r requirements.txt
+# Isolated integration tests only; production PostgreSQL is supplied by Docker.
+pgserver==0.1.4

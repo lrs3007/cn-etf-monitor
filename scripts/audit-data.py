@@ -1,0 +1,54 @@
+"""Audit every active snapshot, including full-date factor coverage and mature labels."""
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sqlalchemy import func, select
+from backend.app.config import HORIZONS, INDICES
+from backend.app.db import SessionLocal
+from backend.app.models import Bar, FactorValue, ForwardReturn, MarketIndex, Snapshot
+
+
+def main():
+    report = []
+    reference = None
+    with SessionLocal() as session:
+        for spec in INDICES:
+            market = session.get(MarketIndex, spec.code)
+            assert market and market.active_snapshot, f"{spec.code}: 尚未回填"
+            snapshot = session.get(Snapshot, market.active_snapshot)
+            sid = snapshot.id
+            dates = session.scalars(select(Bar.trade_date).where(Bar.snapshot_id == sid).order_by(Bar.trade_date)).all()
+            count = len(dates)
+            assert count == snapshot.coverage["rows"]
+            assert len(set(dates)) == count
+            assert dates[0] == snapshot.coverage["first_date"] and dates[-1] == snapshot.coverage["last_date"]
+            definitions = snapshot.coverage["factor_definitions"]
+            for factor_id in definitions:
+                factor_dates = session.scalars(select(FactorValue.trade_date).where(
+                    FactorValue.snapshot_id == sid, FactorValue.factor_id == factor_id)).all()
+                assert len(factor_dates) == count and set(factor_dates) == set(dates), f"{spec.code}/{factor_id}: 日期覆盖不完整"
+            for horizon in HORIZONS:
+                mature = session.scalar(select(func.count()).select_from(ForwardReturn).where(
+                    ForwardReturn.snapshot_id == sid, ForwardReturn.horizon == horizon, ForwardReturn.status == "ok"))
+                assert mature == count - horizon
+            if reference is None:
+                reference = set(dates)
+            expected = {d for d in reference if dates[0] <= d <= dates[-1]}
+            missing = sorted(expected - set(dates))
+            report.append({"index": spec.code, "name": spec.short_name, "first_date": dates[0], "last_date": dates[-1],
+                "rows": count, "factor_rows": count * len(definitions), "missing_vs_csi300_sessions": missing,
+                "amount_rows": snapshot.coverage["amount_rows"], "valuation_rows": snapshot.coverage["valuation_rows"],
+                "backcast_rows": snapshot.coverage["backcast_rows"], "snapshot_id": sid})
+    output = {"checks": "passed", "indices": report, "total_bars": sum(r["rows"] for r in report),
+        "total_factor_rows": sum(r["factor_rows"] for r in report),
+        "calendar_note": "指数间逐日交叉检查，不等于独立交易所日历认证"}
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    artifact = Path(__file__).resolve().parents[1] / "artifacts/coverage-report.json"
+    artifact.parent.mkdir(exist_ok=True)
+    artifact.write_text(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
