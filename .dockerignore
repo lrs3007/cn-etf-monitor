@@ -2,6 +2,10 @@
 .venv
 node_modules
 .next
+.next-local
+.next-published
+.netlify
+out
 data
 artifacts
 .env

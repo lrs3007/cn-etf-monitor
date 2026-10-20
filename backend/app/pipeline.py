@@ -6,11 +6,11 @@ import uuid
 import numpy as np
 from sqlalchemy import insert, select
 
-from .config import DATA_DIR, ENGINE_VERSION, HORIZONS, INDICES, now_iso
+from .config import DATA_DIR, ENGINE_VERSION, HORIZONS, INDICES, SPREAD_FACTOR, factor_horizons, now_iso
 from .db import SessionLocal, init_db
 from .evaluation import build_assessment, evaluate_factor, finite, forward_returns
 from .factors import REGISTRY, calculate_all
-from .models import Assessment, Bar, Evaluation, FactorDefinition, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot
+from .models import Assessment, Bar, Evaluation, FactorDefinition, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot, MacroSeries, MacroObservation, ValuationObservation, FactorInput
 from .providers import full_history
 
 
@@ -57,7 +57,7 @@ def refresh_assessments(specs=INDICES):
                     Evaluation.snapshot_id == snapshot.id, Evaluation.horizon == h)).all()}
                 result = build_assessment(frame, factors, evaluations, snapshot.coverage["factor_definitions"], h)
                 session.get(Assessment, (snapshot.id, h)).result = result
-        print(f"[{spec.short_name}] 综合观察已更新为规则v4", flush=True)
+        print(f"[{spec.short_name}] 综合观察已更新为规则v5", flush=True)
 
 
 def seed():
@@ -79,19 +79,21 @@ def bulk(session, model, rows, chunk=2000):
         session.execute(insert(model), rows[start:start + chunk])
 
 
-def process_index(spec, offline=False, force=False):
+def process_index(spec, offline=False, force=False, bond_context=None):
     print(f"[{spec.short_name}] 获取全部历史…", flush=True)
-    frame, coverage = full_history(spec, offline=offline)
+    frame, coverage = full_history(spec, offline=offline, bond_context=bond_context)
+    lineage = frame.attrs.get("spread_inputs", {"inputs": [], "valuations": [], "bonds": []})
     if len(frame) < 60:
         raise ValueError("历史少于60个交易日，拒绝替换已有数据")
     metadata = {key: definition.metadata() for key, definition in REGISTRY.items()}
-    dataset_hash = hashlib.sha256((frame.to_csv(index=False) + json.dumps(metadata, sort_keys=True) + ENGINE_VERSION).encode()).hexdigest()
+    dataset_hash = hashlib.sha256((frame.to_csv(index=False) + json.dumps(metadata, sort_keys=True)
+        + json.dumps(lineage["inputs"], sort_keys=True) + ENGINE_VERSION).encode()).hexdigest()
     with SessionLocal() as session:
         market = session.get(MarketIndex, spec.code)
         previous = session.get(Snapshot, market.active_snapshot) if market.active_snapshot else None
         if previous and previous.dataset_hash == dataset_hash and not force:
             return {"index": spec.code, "snapshot": previous.id, "status": "unchanged", "rows": len(frame),
-                "warnings": coverage["provider_errors"]}
+                "first_date": frame.date.iloc[0], "last_date": frame.date.iloc[-1], "warnings": coverage["provider_errors"]}
         if previous:
             if (len(frame) < previous.coverage["rows"] or frame.date.iloc[-1] < previous.coverage["last_date"]
                 or frame.date.iloc[0] > previous.coverage["first_date"]):
@@ -99,12 +101,17 @@ def process_index(spec, offline=False, force=False):
             for field in ("volume_rows", "amount_rows", "valuation_rows"):
                 if coverage[field] < previous.coverage.get(field, 0):
                     raise ValueError(f"{field}覆盖倒退，保留原快照；检查补充数据源")
+            prior_spread = previous.coverage["factor_coverage"].get(SPREAD_FACTOR, {}).get("valid", 0)
+            current_spread = ((frame.spread_pe_ttm > 0) & frame.cgb_10y_yield.notna()).sum()
+            if current_spread < prior_spread:
+                raise ValueError("股债收益差覆盖倒退，保留原快照；检查国债或PE数据源")
     print(f"[{spec.short_name}] {len(frame)}日，{frame.date.iloc[0]} → {frame.date.iloc[-1]}；计算{len(REGISTRY)}因子全历史…", flush=True)
     factors = calculate_all(frame)
     snapshot_id = uuid.uuid4().hex
     coverage["factor_definitions"] = metadata
     coverage["factor_coverage"] = {}
-    evaluations = {h: {} for h in HORIZONS}
+    all_horizons = sorted({h for key in factors for h in factor_horizons(key)})
+    evaluations = {h: {} for h in all_horizons}
     rolling_rows = []
     for key, (values, status) in factors.items():
         valid = values.notna()
@@ -113,7 +120,7 @@ def process_index(spec, offline=False, force=False):
             "undefined": int((status == "undefined").sum()),
             "first_valid": frame.loc[valid, "date"].iloc[0] if valid.any() else None,
             "last_valid": frame.loc[valid, "date"].iloc[-1] if valid.any() else None}
-        for h in HORIZONS:
+        for h in factor_horizons(key):
             evaluation, rolling = evaluate_factor(frame, values, h, spec.launch_date, key)
             evaluations[h][key] = evaluation
             for row in rolling:
@@ -121,14 +128,24 @@ def process_index(spec, offline=False, force=False):
         print(f"[{spec.short_name}] {key}: {int(valid.sum())}/{len(frame)}", flush=True)
     from .diagnostics import diagnose_all
     diagnostics = diagnose_all(frame, factors, spec.launch_date)
-    for h in HORIZONS:
-        for key in factors:
+    for h in all_horizons:
+        for key in evaluations[h]:
             evaluations[h][key]["predictive_diagnostics"] = diagnostics[key]
     # Publication is one transaction. Readers keep seeing the previous complete snapshot until commit.
     with SessionLocal.begin() as session:
         session.add(Snapshot(id=snapshot_id, index_code=spec.code, created_at=now_iso(), engine_version=ENGINE_VERSION,
             dataset_hash=dataset_hash, status="published", coverage=coverage))
         session.flush()
+        from .equity_bond import SERIES_ID, SERIES_METADATA
+        if not session.get(MacroSeries, SERIES_ID):
+            session.add(MacroSeries(id=SERIES_ID, metadata_json=SERIES_METADATA))
+            session.flush()
+        for model, rows in ((MacroObservation, lineage["bonds"]), (ValuationObservation, lineage["valuations"])):
+            if rows:
+                existing = set(session.scalars(select(model.id)))
+                bulk(session, model, [row for row in rows if row["id"] not in existing])
+        session.flush()
+        bulk(session, FactorInput, [{"snapshot_id": snapshot_id, **row} for row in lineage["inputs"]])
         bars = []
         for row in frame.to_dict("records"):
             bars.append({"snapshot_id": snapshot_id, "trade_date": row["date"],
@@ -138,7 +155,7 @@ def process_index(spec, offline=False, force=False):
         for key, (values, status) in factors.items():
             bulk(session, FactorValue, [{"snapshot_id": snapshot_id, "factor_id": key, "trade_date": str(dt),
                 "value": finite(v), "status": str(s)} for dt, v, s in zip(frame.date, values, status)])
-        for h in HORIZONS:
+        for h in all_horizons:
             returns = forward_returns(frame.close, h)
             dates = frame.date.shift(-h)
             bulk(session, ForwardReturn, [{"snapshot_id": snapshot_id, "trade_date": str(dt), "horizon": h,
@@ -146,8 +163,9 @@ def process_index(spec, offline=False, force=False):
                 "status": "ok" if np.isfinite(v) else "immature"} for dt, v, end in zip(frame.date, returns, dates)])
             bulk(session, Evaluation, [{"snapshot_id": snapshot_id, "factor_id": key, "horizon": h, "result": value}
                 for key, value in evaluations[h].items()])
-            session.add(Assessment(snapshot_id=snapshot_id, horizon=h,
-                result=build_assessment(frame, factors, evaluations[h], metadata, h)))
+            if h in HORIZONS:
+                session.add(Assessment(snapshot_id=snapshot_id, horizon=h,
+                    result=build_assessment(frame, factors, evaluations[h], metadata, h)))
         bulk(session, RollingEvaluation, rolling_rows)
         session.get(MarketIndex, spec.code).active_snapshot = snapshot_id
     print(f"[{spec.short_name}] 已发布 {snapshot_id}", flush=True)
@@ -155,19 +173,33 @@ def process_index(spec, offline=False, force=False):
         "first_date": frame.date.iloc[0], "last_date": frame.date.iloc[-1], "warnings": coverage["provider_errors"]}
 
 
-def run_pipeline(specs=INDICES, offline=False, force=False):
+def run_pipeline(specs=INDICES, offline=False, force=False, run_id=None):
     seed()
-    run_id = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
     with SessionLocal.begin() as session:
-        session.add(JobRun(id=run_id, started_at=now_iso(), status="running", details={"indices": [s.code for s in specs]}))
+        job = session.get(JobRun, run_id)
+        if job:
+            job.status = "running"
+        else:
+            session.add(JobRun(id=run_id, started_at=now_iso(), status="running", details={"indices": [s.code for s in specs]}))
     results, errors = [], []
+    from .equity_bond import load_bond_history
+    print("[国债] 获取中债10年期国债收益率历史…", flush=True)
+    bond_context = load_bond_history(offline=offline, force=force)
+    print(f"[国债] {len(bond_context['observations'])}条观测，{len(bond_context['errors'])}条源提示", flush=True)
     for spec in specs:
+        with SessionLocal.begin() as session:
+            session.get(JobRun, run_id).details = {"indices": [s.code for s in specs],
+                "active_index": spec.code, "results": list(results), "errors": list(errors)}
         try:
-            results.append(process_index(spec, offline=offline, force=force))
+            results.append(process_index(spec, offline=offline, force=force, bond_context=bond_context))
         except Exception as exc:
             import traceback
             traceback.print_exc()
             errors.append({"index": spec.code, "error": str(exc)})
+        with SessionLocal.begin() as session:
+            session.get(JobRun, run_id).details = {"indices": [s.code for s in specs],
+                "results": list(results), "errors": list(errors)}
     with SessionLocal.begin() as session:
         job = session.get(JobRun, run_id)
         job.finished_at = now_iso()

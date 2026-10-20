@@ -132,6 +132,9 @@ def load_valuations(spec, offline=False):
             if np.isinf(frame[column].to_numpy(dtype=float)).any():
                 raise ProviderError(f"{path.name}: {column} 不可为无穷值")
         records = frame.to_dict("records")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        for row in records:
+            row.update(source="csv", raw_sha256=digest, availability_assumed=False)
         notes.append("估值由本地CSV导入，按available_date对齐")
     token = os.getenv("TUSHARE_TOKEN")
     if token and not offline:
@@ -153,7 +156,8 @@ def load_valuations(spec, offline=False):
                     records.append({"date": dt.strftime("%Y-%m-%d"),
                         # dailybasic does not publish PIT timestamps; conservative next-calendar-day eligibility
                         "available_date": (dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                        "pe_ttm": item.get("pe_ttm"), "pb": item.get("pb")})
+                        "pe_ttm": item.get("pe_ttm"), "pb": item.get("pb"),
+                        "source": "tushare", "raw_sha256": hashlib.sha256(text.encode()).hexdigest()})
             except ProviderError as exc:
                 notes.append(f"估值接口未完成：{exc}")
                 break
@@ -213,7 +217,7 @@ def csindex_history(spec, offline=False):
     return frame[["date", "open", "high", "low", "close", "volume", "amount", "pe_observed", "source"]].drop_duplicates("date", keep="last"), record
 
 
-def full_history(spec, offline=False):
+def full_history(spec, offline=False, bond_context=None):
     frames, records, errors = {}, [], []
     for name, provider in (("sina", sina_history), ("eastmoney", eastmoney_history)):
         try:
@@ -327,7 +331,7 @@ def full_history(spec, offline=False):
         for _, row in valid_pe.iterrows():
             valuations.insert(0, {"date": row["date"],
                 "available_date": (date.fromisoformat(str(row["date"])) + timedelta(days=1)).isoformat(),
-                "pe_ttm": row["pe_observed"], "pb": np.nan})
+                "pe_ttm": row["pe_observed"], "pb": np.nan, "source": "csindex"})
         if len(valid_pe):
             valuation_notes.append("中证官方滚动市盈率仅覆盖实际提供区间；采用次日可用假设，非严格点时数据，不补齐早期缺失")
     if valuations:
@@ -341,6 +345,10 @@ def full_history(spec, offline=False):
                 for col in ("pe_ttm", "pb"):
                     frame.loc[eligible[0], col] = pd.to_numeric(row[col], errors="coerce")
         # Intentionally do not forward-fill missing daily observations.
+    from .equity_bond import align_spread_inputs
+    bond_context = bond_context or {"observations": [], "source_records": [], "errors": []}
+    frame, spread_inputs = align_spread_inputs(frame, valuations, bond_context, spec.code, records)
+    frame.attrs["spread_inputs"] = spread_inputs
     frame["history_type"] = np.where(frame.date < spec.launch_date, "backcast", "live")
     frame["availability"] = frame.date + "T16:00:00+08:00"
     coverage = {
@@ -354,5 +362,10 @@ def full_history(spec, offline=False):
         "volume_rows": int(frame.volume.notna().sum()), "amount_rows": int(frame.amount.notna().sum()),
         "valuation_rows": int(frame.pe_ttm.notna().sum()),
         "calendar_verified": False,
+        "bond_source_records": bond_context["source_records"], "bond_provider_errors": bond_context["errors"],
+        "bond_series": "中债国债收益率曲线 · 10年期到期收益率；按同日观测配对，下一交易日信号",
+        "bond_history_coverage": {"rows": len(bond_context["observations"]),
+            "first_date": min((r["observation_date"] for r in bond_context["observations"]), default=None),
+            "last_date": max((r["observation_date"] for r in bond_context["observations"]), default=None)},
     }
     return frame, coverage

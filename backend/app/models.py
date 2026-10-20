@@ -102,3 +102,38 @@ class Assessment(Base):
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("data_snapshots.id"), primary_key=True)
     horizon: Mapped[int] = mapped_column(Integer, primary_key=True)
     result: Mapped[dict] = mapped_column(JSON)
+
+
+class MacroSeries(Base):
+    __tablename__ = "macro_series"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON)
+
+
+class MacroObservation(Base):
+    __tablename__ = "macro_observations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    series_id: Mapped[str] = mapped_column(ForeignKey("macro_series.id"))
+    observation_date: Mapped[str] = mapped_column(String(10), index=True)
+    available_date: Mapped[str] = mapped_column(String(10))
+    value: Mapped[float] = mapped_column(Float)
+    provenance: Mapped[dict] = mapped_column(JSON)
+
+
+class ValuationObservation(Base):
+    __tablename__ = "valuation_observations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    index_code: Mapped[str] = mapped_column(ForeignKey("market_indices.code"))
+    observation_date: Mapped[str] = mapped_column(String(10))
+    available_date: Mapped[str] = mapped_column(String(10))
+    pe_ttm: Mapped[float] = mapped_column(Float)
+    provenance: Mapped[dict] = mapped_column(JSON)
+
+
+class FactorInput(Base):
+    __tablename__ = "factor_inputs"
+    snapshot_id: Mapped[str] = mapped_column(ForeignKey("data_snapshots.id"), primary_key=True)
+    factor_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    trade_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+    valuation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("valuation_observations.id"))
+    bond_id: Mapped[Optional[str]] = mapped_column(ForeignKey("macro_observations.id"))

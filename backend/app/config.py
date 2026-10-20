@@ -13,7 +13,13 @@ DATA_DIR.mkdir(exist_ok=True)
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'monitor.db'}")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 HORIZONS = (1, 5, 10, 20, 60)
-ENGINE_VERSION = "2026.10.v4"
+ENGINE_VERSION = "2026.10.v5-spread"
+SPREAD_FACTOR = "equity_bond_spread_10y"
+EXTRA_FACTOR_HORIZONS = {SPREAD_FACTOR: (120, 252)}
+
+
+def factor_horizons(factor_id):
+    return HORIZONS + EXTRA_FACTOR_HORIZONS.get(factor_id, ())
 
 
 def now_iso():

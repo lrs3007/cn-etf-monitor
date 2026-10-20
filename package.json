@@ -6,19 +6,29 @@
     "dev": "next dev --hostname 127.0.0.1",
     "build": "next build",
     "start": "next start --hostname 127.0.0.1",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:published": "NEXT_PUBLIC_DATA_MODE=published next build",
+    "deploy:netlify": "npm run build:published && netlify deploy --no-build --dir=.next-published --functions=netlify/functions --prod",
+    "test:publication": "node --test tests/publication.test.mjs",
+    "preview:published": "node scripts/preview-published.mjs"
   },
   "dependencies": {
+    "@netlify/blobs": "^11.1.4",
+    "@netlify/functions": "^6.0.2",
+    "echarts": "^6.0.0",
+    "lucide-react": "^0.468.0",
     "next": "^16.0.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "echarts": "^6.0.0",
-    "lucide-react": "^0.468.0"
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "typescript": "^5.9.0",
+    "@netlify/dev-utils": "^6.0.3",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0"
+    "@types/react-dom": "^19.0.0",
+    "https-proxy-agent": "^8.0.0",
+    "netlify-cli": "^27.13.0",
+    "node-fetch": "^3.3.2",
+    "typescript": "^5.9.0"
   }
 }

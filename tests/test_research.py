@@ -19,7 +19,7 @@ def frame():
 
 def test_all_factors_are_prefix_invariant_and_cover_every_date(frame):
     full, prefix = calculate_all(frame), calculate_all(frame.iloc[:830])
-    assert len(REGISTRY) == 19
+    assert len(REGISTRY) == 20
     for key in REGISTRY:
         assert len(full[key][0]) == len(frame)
         pd.testing.assert_series_equal(full[key][0].iloc[:830], prefix[key][0])

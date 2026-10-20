@@ -5,6 +5,8 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+from .config import SPREAD_FACTOR, factor_horizons
+
 
 @dataclass(frozen=True)
 class Factor:
@@ -18,9 +20,17 @@ class Factor:
     description: str
     compute: Callable = field(repr=False, compare=False)
     version: int = 1
+    assessment_enabled: bool = True
+    min_percentile_samples: int = 60
 
     def metadata(self):
-        return {k: v for k, v in asdict(self).items() if k != "compute"}
+        result = {k: v for k, v in asdict(self).items() if k != "compute"}
+        if self.assessment_enabled:
+            result.pop("assessment_enabled")
+        if self.min_percentile_samples == 60:
+            result.pop("min_percentile_samples")
+        result["horizons"] = factor_horizons(self.id)
+        return result
 
 
 REGISTRY: dict[str, Factor] = {}
@@ -91,8 +101,18 @@ for column, label in (("pe_ttm", "PE-TTM"), ("pb", "PB")):
         "数据源提供值，按可用日期对齐，不前向填充", "依赖额外估值数据；无数据时明确缺失，不用指数点位推算估值。",
         lambda f, c=column: f[c]))
 
+register(Factor(SPREAD_FACTOR, "股债收益差 · 10年国债", "估值", "百分点", 1,
+    ("spread_pe_ttm", "cgb_10y_yield"), "100 / PE-TTM − 10年期国债到期收益率(%)",
+    "同一观测日的指数盈利收益率减去中债10年国债到期收益率。保守按下一交易日可用，不填补缺失；数值越高表示按此口径股票相对国债更有吸引力，不代表预期收益。首版不参与综合评分。",
+    lambda f: 100 / f.spread_pe_ttm.where(f.spread_pe_ttm > 0) - f.cgb_10y_yield,
+    assessment_enabled=False, min_percentile_samples=756))
+
 
 def calculate_all(frame):
+    frame = frame.copy()
+    for column in {column for definition in REGISTRY.values() for column in definition.inputs}:
+        if column not in frame:
+            frame[column] = np.nan
     results = {}
     for key, definition in REGISTRY.items():
         values = definition.compute(frame).replace([np.inf, -np.inf], np.nan)

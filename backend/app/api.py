@@ -1,15 +1,19 @@
 import secrets
 from contextlib import asynccontextmanager
 import os
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from sqlalchemy import select
 
-from .config import HORIZONS, INDEX_MAP, INDICES, now_iso
+from .config import HORIZONS, INDEX_MAP, INDICES, SPREAD_FACTOR, factor_horizons, now_iso
 from .db import SessionLocal
-from .models import Assessment, Bar, Evaluation, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot
+from .factor_analysis import web_analysis
+from .models import Assessment, Bar, Evaluation, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot, FactorInput, MacroObservation, ValuationObservation
 from .pipeline import seed
+from .updates import UpdateBusy, start_update, update_status
 
 
 @asynccontextmanager
@@ -75,19 +79,44 @@ def dashboard(code: str, horizon: int = 20):
 
 @app.get("/api/v1/indices/{code}/factors/{factor_id}")
 def factor_detail(code: str, factor_id: str, horizon: int = 20, snapshot_id: str | None = None):
-    validate_horizon(horizon)
+    if horizon not in factor_horizons(factor_id):
+        raise HTTPException(422, "该因子不支持此预测期限")
     with SessionLocal() as session:
         snapshot = snapshot_for(session, code, snapshot_id)
         if factor_id not in snapshot.coverage["factor_definitions"]:
             raise HTTPException(404, "未知因子")
         evaluation = session.get(Evaluation, (snapshot.id, factor_id, horizon))
+        if not evaluation:
+            raise HTTPException(404, "当前快照尚未计算该期限，请更新数据")
         values = session.scalars(select(FactorValue).where(FactorValue.snapshot_id == snapshot.id,
             FactorValue.factor_id == factor_id).order_by(FactorValue.trade_date)).all()
+        bars = session.execute(select(Bar.trade_date, Bar.close).where(Bar.snapshot_id == snapshot.id).order_by(Bar.trade_date)).all()
+        if [row.trade_date for row in bars] != [v.trade_date for v in values]:
+            raise HTTPException(503, "当前因子与行情日期未对齐，请重新计算")
+        evaluations = {item.horizon: item.result for item in session.scalars(select(Evaluation).where(
+            Evaluation.snapshot_id == snapshot.id, Evaluation.factor_id == factor_id))}
         returns = {r.trade_date: r.value for r in session.scalars(select(ForwardReturn).where(
             ForwardReturn.snapshot_id == snapshot.id, ForwardReturn.horizon == horizon)).all()}
         rolling = session.scalars(select(RollingEvaluation).where(RollingEvaluation.snapshot_id == snapshot.id,
             RollingEvaluation.factor_id == factor_id, RollingEvaluation.horizon == horizon).order_by(RollingEvaluation.as_of)).all()
+        components = []
+        if factor_id == SPREAD_FACTOR:
+            inputs = session.execute(select(FactorInput, ValuationObservation, MacroObservation)
+                .outerjoin(ValuationObservation, FactorInput.valuation_id == ValuationObservation.id)
+                .outerjoin(MacroObservation, FactorInput.bond_id == MacroObservation.id)
+                .where(FactorInput.snapshot_id == snapshot.id, FactorInput.factor_id == factor_id)
+                .order_by(FactorInput.trade_date)).all()
+            components = [{"date": row.trade_date, "observation_date": pe.observation_date if pe else None,
+                "available_date": max(pe.available_date, bond.available_date) if pe and bond else None,
+                "pe_ttm": pe.pe_ttm if pe else None,
+                "earnings_yield": 100 / pe.pe_ttm if pe and pe.pe_ttm > 0 else None,
+                "bond_yield": bond.value if bond else None,
+                "valuation_source": pe.provenance if pe else None, "bond_source": bond.provenance if bond else None}
+                for row, pe, bond in inputs]
         return {"snapshot_id": snapshot.id, "definition": snapshot.coverage["factor_definitions"][factor_id],
+            "analysis": web_analysis([b.trade_date for b in bars], [b.close for b in bars], [v.value for v in values],
+                snapshot.coverage["factor_definitions"][factor_id], evaluations, INDEX_MAP[code].launch_date),
+            "components": components,
             "coverage": snapshot.coverage["factor_coverage"][factor_id], "evaluation": evaluation.result,
             "series": [{"date": v.trade_date, "value": v.value, "status": v.status,
                 "forward_return": returns.get(v.trade_date)} for v in values],
@@ -110,8 +139,51 @@ def require_admin(authorization: str | None = Header(default=None)):
         raise HTTPException(401, "管理认证失败")
 
 
+def require_update_access(request: Request):
+    """Local same-origin browser writes, or explicitly authenticated API clients."""
+    authorization = request.headers.get("authorization")
+    if authorization:
+        require_admin(authorization)
+        return
+
+    def loopback(host):
+        if host == "localhost":
+            return True
+        try:
+            return ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    try:
+        origin = urlsplit(request.headers.get("origin", ""))
+    except ValueError:
+        raise HTTPException(403, "无效的请求来源") from None
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if (not request.client or not loopback(request.client.host)
+        or origin.scheme not in ("http", "https") or not loopback(origin.hostname or "")
+        or origin.netloc != host or request.headers.get("forwarded")
+        or any(not loopback(ip.strip()) for ip in forwarded.split(",") if ip.strip())
+        or request.headers.get("sec-fetch-site", "same-origin") != "same-origin"):
+        raise HTTPException(403, "仅允许本机同源网页更新；远程调用请使用管理认证")
+
+
+@app.get("/api/v1/updates/latest")
+def latest_update():
+    from fastapi.responses import JSONResponse
+    return JSONResponse(update_status(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/v1/updates", status_code=202, dependencies=[Depends(require_update_access)])
+def create_update():
+    try:
+        return start_update()
+    except UpdateBusy as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
 @app.get("/api/v1/admin/config", dependencies=[Depends(require_admin)])
 def admin_config():
     # Never return credentials, even to authenticated callers.
-    return {"tushare_configured": bool(os.getenv("TUSHARE_TOKEN")), "remote_updates": False,
+    return {"tushare_configured": bool(os.getenv("TUSHARE_TOKEN")), "remote_updates": bool(os.getenv("ADMIN_TOKEN")),
         "update_command": "python -m backend.app.cli update"}

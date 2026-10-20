@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-from .config import HORIZONS
+from .config import HORIZONS, SPREAD_FACTOR
 
 
 def finite(value):
@@ -157,7 +157,8 @@ def build_assessment(frame, results, evaluations, metadata, horizon):
         evaluation = evaluations[key]
         current = finite(values.iloc[-1])
         historical = values.iloc[-1260:].dropna()
-        percentile = float((historical <= current).mean() * 100) if current is not None and len(historical) >= 60 else None
+        minimum = metadata[key].get("min_percentile_samples", 60)
+        percentile = float((historical <= current).mean() * 100) if current is not None and len(historical) >= minimum else None
         # Current direction learned only from matured historical labels, never future observations.
         train = values.iloc[:-horizon] if horizon else values
         target = forward_returns(frame.close, horizon).iloc[:-horizon]
@@ -167,7 +168,7 @@ def build_assessment(frame, results, evaluations, metadata, horizon):
         consistency = evaluation["direction_consistency"]
         ci = evaluation.get("ci")
         interval_supports_direction = bool(ci and (ci["lower"] > 0 or ci["upper"] < 0))
-        eligible = (current is not None and percentile is not None and direction_ic is not None
+        eligible = (metadata[key].get("assessment_enabled", True) and current is not None and percentile is not None and direction_ic is not None
             and oos is not None and evaluation["oos_samples"] >= 252 and consistency is not None
             and consistency >= 0.6 and abs(oos) >= .03 and interval_supports_direction
             and np.sign(direction_ic) == np.sign(oos))
@@ -175,7 +176,7 @@ def build_assessment(frame, results, evaluations, metadata, horizon):
         evidence.append({"factor_id": key, "name": metadata[key]["name"], "category": metadata[key]["category"],
             "current": current, "percentile": percentile, "direction_ic": direction_ic, "oos_ic": oos,
             "eligible": bool(eligible), "score": finite(score),
-            "stance": "偏强" if eligible and score > 0.2 else "偏弱" if eligible and score < -0.2 else "中性" if eligible else "证据不足"})
+            "stance": "偏强" if eligible and score > 0.2 else "偏弱" if eligible and score < -0.2 else "中性" if eligible else "估值观察" if not metadata[key].get("assessment_enabled", True) else "证据不足"})
     categories = {}
     for category in dict.fromkeys(item["category"] for item in evidence):
         eligible = [e["score"] for e in evidence if e["category"] == category and e["eligible"]]
@@ -193,7 +194,18 @@ def build_assessment(frame, results, evaluations, metadata, horizon):
         else "短中期趋势偏强" if bias20 is not None and bias60 is not None and bias20 > 0 and bias60 > 0 else "短中期趋势分化")
     if overall is None:
         label = f"{trend} · 预测证据不足"
-    return {"label": label, "score": overall, "horizon": horizon, "as_of": str(last.date), "assessment_version": "4",
+    spread = next((e for e in evidence if e["factor_id"] == SPREAD_FACTOR), None)
+    relative_value = None
+    if spread:
+        level = spread["percentile"]
+        relative_value = {"current": spread["current"], "percentile": level, "unit": "百分点",
+            "text": "股债收益差输入缺失，暂不能判断相对估值。" if spread["current"] is None else
+                "股债收益差已有读数，5年窗口有效样本不足756日，暂不判断历史位置。" if level is None else
+                f"股债收益差处于近5年{level:.1f}%分位，按此口径股票相对国债的吸引力"
+                + ("较高" if level >= 80 else "较低" if level <= 20 else "处于历史中间区间")
+                + "；这是估值观察，不参与综合预测评分。"}
+    return {"label": label, "score": overall, "horizon": horizon, "as_of": str(last.date), "assessment_version": "5",
+        "relative_value": relative_value,
         "headline": f"{horizon}日观察：{label}",
         "text": f"当前{trend}。历史样本外检验中，{eligible_count}个因子、{len(scores)}个类别符合方向稳定性条件。"
             + ("至少需要3个因子且覆盖2类证据，当前尚不足以形成综合预测方向。" if overall is None else f"按当前因子分位汇总，未来{horizon}日观察为{label}；同类先平均，再按类别等权。"),
