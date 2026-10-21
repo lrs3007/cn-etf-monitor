@@ -75,13 +75,16 @@ def test_full_history_export_checks_coverage_and_preserves_last_manifest(tmp_pat
     ("publish", [], True),
 ])
 def test_scheduled_publish_only_after_success(tmp_path, monkeypatch, command, errors, expected_publish):
+    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(cli, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setenv("CN_MONITOR_PUBLISH", "1")
     monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     monkeypatch.setattr(cli, "seed", lambda: None)
     monkeypatch.setattr(cli, "run_pipeline", lambda *a, **kw: {"errors": errors})
     monkeypatch.setattr(publication, "export_results", lambda: {"export_id": "test", "objects": {}})
     calls = []
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: (calls.append(a) or SimpleNamespace(returncode=0)))
+    monkeypatch.setattr(publication, "publish_current_results", lambda: (calls.append(True) or {"status": "published"}))
     monkeypatch.setattr("sys.argv", ["cli", command])
     if errors:
         with pytest.raises(SystemExit): cli.main()

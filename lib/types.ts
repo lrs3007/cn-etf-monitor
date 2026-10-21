@@ -1,9 +1,12 @@
 export type Nullable = number | null;
 export interface UpdateStatus {
   busy: boolean;
+  can_stop?: boolean;
   job: { id: string; status: string; started_at: string; finished_at: string | null;
-    details: { active_index?: string; indices?: string[];
-      publication?: { status: "publishing" | "published" | "unchanged" | "failed" | "skipped" | "disabled" | "interrupted";
+    details: { active_index?: string; indices?: string[]; trigger?: string; stop_requested_at?: string;
+      progress?: { stage: string; stopped_stage?: string; label: string; completed?: Nullable; total?: Nullable; unit?: string | null;
+        updated_at: string; completed_bytes?: Nullable; total_bytes?: Nullable; legacy?: boolean; };
+      publication?: { status: "publishing" | "published" | "unchanged" | "failed" | "skipped" | "disabled" | "interrupted" | "cancelled";
         export_id?: string; published_at?: string; finished_at?: string; error?: string; };
       results?: { index: string; status: string; last_date?: string; rows: number; warnings?: string[] }[];
       errors?: { index?: string; error: string }[]; }; } | null;

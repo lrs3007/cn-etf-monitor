@@ -6,7 +6,11 @@ The manifest is written last. Remote publishing follows the same protocol.
 import gzip
 import hashlib
 import json
+import os
+import selectors
 import subprocess
+import time
+from types import SimpleNamespace
 from pathlib import Path
 
 from sqlalchemy import select
@@ -14,6 +18,7 @@ from sqlalchemy import select
 from .config import DATA_DIR, HORIZONS, INDICES, ROOT, SPREAD_FACTOR, factor_horizons, now_iso
 from .db import SessionLocal
 from .factor_analysis import web_analysis
+from .job_control import cancellation_file, check_cancelled, report_progress
 from .models import (Assessment, Bar, Evaluation, FactorInput, FactorValue, ForwardReturn,
                      MacroObservation, MarketIndex, RollingEvaluation, Snapshot, ValuationObservation)
 
@@ -42,8 +47,11 @@ def publish_current_results():
     manifest = export_results()
     # stderr inherits the local worker log; stdout contains only the final JSON receipt.
     try:
-        process = subprocess.run(["node", "scripts/publish-results.mjs"], cwd=ROOT,
-                                 stdout=subprocess.PIPE, text=True, check=False, timeout=1800)
+        if cancellation_file():
+            process = run_publisher()
+        else:
+            process = subprocess.run(["node", "scripts/publish-results.mjs"], cwd=ROOT,
+                                     stdout=subprocess.PIPE, text=True, check=False, timeout=1800)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("网页同步超时，本机计算结果已保留") from exc
     if process.returncode:
@@ -58,6 +66,51 @@ def publish_current_results():
     return {"status": "published" if receipt["changed"] else "unchanged",
             "export_id": manifest["export_id"], "published_at": receipt["published_at"],
             "finished_at": now_iso()}
+
+
+def run_publisher():
+    """Stream structured progress without exposing uploader logs or credentials."""
+    report_progress("upload", "连接网页结果存储，核对待同步对象")
+    env = {**os.environ, "CN_MONITOR_CANCEL_FILE": cancellation_file()}
+    deadline, buffer, receipt = time.monotonic() + 1800, b"", []
+    with subprocess.Popen(["node", "scripts/publish-results.mjs", "--progress"], cwd=ROOT,
+                          stdout=subprocess.PIPE, env=env) as process:
+        try:
+            os.set_blocking(process.stdout.fileno(), False)
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    check_cancelled()
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(process.args, 1800)
+                    if not selector.select(.25):
+                        continue
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        if line.startswith(b"CN_MONITOR_PROGRESS "):
+                            item = json.loads(line[len(b"CN_MONITOR_PROGRESS "):])
+                            phase = item.get("phase", "upload")
+                            report_progress(phase, "确认并切换完整网页版本" if phase == "finalize" else "核对并同步网页结果对象",
+                                item.get("completed"), item.get("total"), "个对象",
+                                completed_bytes=item.get("completed_bytes"), total_bytes=item.get("total_bytes"))
+                        elif line.strip():
+                            receipt.append(line.decode())
+            if buffer.strip():
+                receipt.append(buffer.decode())
+            process.wait(timeout=max(1, deadline - time.monotonic()))
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+    return SimpleNamespace(returncode=process.returncode, stdout="\n".join(receipt))
 
 
 def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
@@ -78,7 +131,15 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
         manifest["objects"][name] = {"key": key, "bytes": len(data), "sha256": digest}
 
     with session_factory() as session:
+        total_objects = 0
         for spec in specs:
+            market = session.get(MarketIndex, spec.code)
+            snapshot = session.get(Snapshot, market.active_snapshot) if market and market.active_snapshot else None
+            if snapshot:
+                total_objects += 1 + len(snapshot.coverage["factor_definitions"])
+        for spec in specs:
+            check_cancelled()
+            report_progress("export", f"{spec.short_name}：导出全历史与逐因子分析", len(manifest["objects"]), total_objects, "份结果")
             market = session.get(MarketIndex, spec.code)
             snap = session.get(Snapshot, market.active_snapshot) if market and market.active_snapshot else None
             if not snap or snap.status != "published" or snap.index_code != spec.code:
@@ -108,6 +169,7 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
                 "prices": [{"date": b.trade_date, **{k: getattr(b, k) for k in
                     ("open", "high", "low", "close", "volume", "amount", "history_type")}} for b in bars]})
             for fid, definition in definitions.items():
+                report_progress("export", f"{spec.short_name}：导出{definition['name']}分析", len(manifest["objects"]), total_objects, "份结果")
                 if any(str(h) not in evaluations.get(fid, {}) for h in factor_horizons(fid)):
                     raise ValueError(f"{spec.code} {fid} 缺少IC期限")
                 values = session.scalars(select(FactorValue).where(FactorValue.snapshot_id == snap.id,
@@ -137,7 +199,9 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
                         definition, evaluations[fid], spec.launch_date)})
             manifest["indices"].append({"code": spec.code, "name": spec.name, "short_name": spec.short_name,
                 "description": spec.description, "ready": True, "coverage": coverage, "snapshot_id": snap.id})
+        report_progress("export", "全历史与逐因子分析导出完成", len(manifest["objects"]), total_objects, "份结果")
     manifest["export_id"] = hashlib.sha256(encoded(manifest)).hexdigest()
+    check_cancelled()
     manifest["generated_at"] = now_iso()
     temporary = root / "manifest.tmp"
     temporary.write_bytes(encoded(manifest))

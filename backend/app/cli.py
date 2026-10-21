@@ -2,11 +2,15 @@ import argparse
 import fcntl
 import json
 import os
-import subprocess
 import sys
+import uuid
 
 from .config import DATA_DIR, INDEX_MAP, INDICES, ROOT
 from .pipeline import refresh_assessments, refresh_diagnostics, run_pipeline, seed
+from .db import SessionLocal
+from .models import JobRun
+from .config import now_iso
+from .job_control import UpdateCancelled, control_job
 
 
 def main():
@@ -40,25 +44,55 @@ def main():
         if args.command == "diagnostics":
             refresh_diagnostics(specs)
             return
-        publish = args.command == "publish" or (args.command == "update" and os.getenv("CN_MONITOR_PUBLISH") == "1")
-        if args.command == "export" or (args.command == "publish" and args.skip_update):
-            result = {"errors": []}
-        else:
-            result = run_pipeline(specs, offline=args.command == "recompute", force=args.force)
-        if args.command == "export" or (publish and not result["errors"]):
-            from .publication import export_results
-            manifest = export_results()
-            print(json.dumps({"export_id": manifest["export_id"], "objects": len(manifest["objects"]),
-                "compressed_bytes": sum(item["bytes"] for item in manifest["objects"].values())}), flush=True)
-            if publish:
-                uploaded = subprocess.run(["node", "scripts/publish-results.mjs"], cwd=ROOT, check=False)
-                if uploaded.returncode:
-                    sys.exit(uploaded.returncode)
-        elif publish:
-            print("更新存在错误，本次未发布；线上保留此前完整结果", file=sys.stderr)
+        run_id = uuid.uuid4().hex
+        try:
+            with control_job(run_id, sessions=SessionLocal, directory=DATA_DIR, install_signals=True):
+                with SessionLocal.begin() as session:
+                    job = session.get(JobRun, run_id)
+                    job.details = {**job.details, "trigger": "cli", "indices": [s.code for s in specs]}
+                result = run_command(args, specs, run_id)
+        except UpdateCancelled:
+            sys.exit(130)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result["errors"]:
         sys.exit(1)
+
+
+def run_command(args, specs, run_id):
+    from .publication import export_results, publish_current_results
+    publish = args.command == "publish" or (args.command == "update" and os.getenv("CN_MONITOR_PUBLISH") == "1")
+    if args.command == "export" or (args.command == "publish" and args.skip_update):
+        result = {"errors": []}
+    else:
+        result = run_pipeline(specs, offline=args.command == "recompute", force=args.force, run_id=run_id)
+    if publish and not result["errors"]:
+        with SessionLocal.begin() as session:
+            job = session.get(JobRun, run_id)
+            job.status, job.finished_at = "publishing", None
+            job.details = {**job.details, "publication": {"status": "publishing"}}
+        try:
+            publication = publish_current_results()
+        except Exception:
+            with SessionLocal.begin() as session:
+                job = session.get(JobRun, run_id)
+                job.status, job.finished_at = "publish_failed", now_iso()
+                job.details = {**job.details, "publication": {"status": "failed"}}
+            sys.exit("本机数据已保留，但网页同步失败，请检查本机日志后重试")
+        with SessionLocal.begin() as session:
+            job = session.get(JobRun, run_id)
+            job.status, job.finished_at = "completed", now_iso()
+            job.details = {**job.details, "publication": publication, "progress": {**job.details.get("progress", {}),
+                "stage": "completed", "label": "网页同步完成", "updated_at": now_iso()}}
+    elif args.command == "export":
+        manifest = export_results()
+        print(json.dumps({"export_id": manifest["export_id"], "objects": len(manifest["objects"])}), flush=True)
+        with SessionLocal.begin() as session:
+            job = session.get(JobRun, run_id)
+            job.status, job.finished_at = "completed", now_iso()
+            job.details = {**job.details, "progress": {"stage": "completed", "label": "本机导出完成", "updated_at": now_iso()}}
+    elif publish:
+        print("更新存在错误，本次未发布；线上保留此前完整结果", file=sys.stderr)
+    return result
 
 
 if __name__ == "__main__":

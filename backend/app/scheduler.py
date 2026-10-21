@@ -1,13 +1,14 @@
 """Separate unattended process. Restart-safe idempotency via date/slot stamp."""
-import subprocess
-import sys
 import time
 from datetime import datetime
 
 from .config import DATA_DIR, SHANGHAI
+from .updates import start_update, UpdateBusy
 
 
 def main():
+    from .pipeline import seed
+    seed()
     slots = ((8, 30), (16, 30), (20, 30))
     directory = DATA_DIR / "schedule"
     directory.mkdir(exist_ok=True)
@@ -18,9 +19,15 @@ def main():
                 if now.hour == hour and now.minute >= minute:
                     stamp = directory / f"{now.date()}-{hour:02d}{minute:02d}.attempted"
                     if not stamp.exists():
-                        result = subprocess.run([sys.executable, "-m", "backend.app.cli", "update"], check=False)
+                        try:
+                            result = start_update(trigger="scheduler")
+                            outcome = f"job={result['job']['id']}"
+                        except UpdateBusy:
+                            outcome = "skipped=another_update_running"
+                        except Exception as exc:
+                            outcome = f"failed={type(exc).__name__}"
                         # At most one attempt per slot, including failures; retry at the next slot.
-                        stamp.write_text(f"{datetime.now(SHANGHAI).isoformat()} exit={result.returncode}")
+                        stamp.write_text(f"{datetime.now(SHANGHAI).isoformat()} {outcome}")
         time.sleep(30)
 
 

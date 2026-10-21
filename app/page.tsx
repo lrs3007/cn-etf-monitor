@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, ArrowDownRight, ArrowUpRight, ArrowRight, BookOpen, Check, ChevronDown, Database, ExternalLink, LoaderCircle, RefreshCw, SlidersHorizontal, X } from "lucide-react";
 import FactorCard from "@/components/FactorCard";
+import SyncProgress from "@/components/SyncProgress";
 import type { Dashboard, IndexInfo, UpdateStatus } from "@/lib/types";
 import { publishedMode, readDashboard, readIndices, refreshPublication, checkPublication } from "@/lib/data-api";
 
@@ -29,6 +30,7 @@ export default function Page() {
   const [sort, setSort] = useState("default");
   const [update, setUpdate] = useState<UpdateStatus | null>(null);
   const [startingUpdate, setStartingUpdate] = useState(false);
+  const [stoppingUpdate, setStoppingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState("");
   const [publishedAt, setPublishedAt] = useState("");
   const lastJob = useRef<string | null>(null);
@@ -130,8 +132,22 @@ export default function Page() {
     finally { setStartingUpdate(false); }
   }
   const syncing = startingUpdate || update?.busy;
+  async function stopSync() {
+    const runId = update?.job?.id;
+    if (!runId || stoppingUpdate) return;
+    setStoppingUpdate(true); setUpdateError("");
+    try {
+      const response = await fetch(`/api/v1/updates/${encodeURIComponent(runId)}/stop`, { method: "POST" });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "无法停止同步");
+      setUpdate(body);
+      if (!body.busy) setRefresh(value => value + 1);
+    } catch (error) { setUpdateError(error instanceof Error ? error.message : "无法停止同步"); }
+    finally { setStoppingUpdate(false); }
+  }
   const publication = update?.job?.details.publication;
   const updateMessage = publishedMode ? `本机计算 · 网页展示已发布结果${publishedAt ? ` · 发布于 ${new Date(publishedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}` : ""}。每分钟自动检查新结果；数据日期以各指数显示为准。` : update?.busy && update.job?.status === "publishing" ? "本机采集与计算已完成，正在同步网页结果，请稍候。" : update?.busy ? `正在同步五个指数${update.job?.details.active_index ? ` · ${defaults.find(i => i.code === update.job?.details.active_index)?.short_name || update.job.details.active_index}` : ""}，行情采集与全历史因子计算可能需要数分钟。`
+    : update?.job?.status === "cancelled" ? "同步已停止，已完成的本机数据保留。可点击刷新数据重新同步。"
     : update?.job?.status === "publish_failed" ? "本机数据已更新，但网页同步失败。线上保留此前结果，可点击刷新数据重试。"
     : update?.job?.status === "publish_interrupted" ? "本机数据已更新，网页同步任务中断。可点击刷新数据重试。"
     : publication?.status === "published" ? `本机数据已更新，网页同步成功 · 发布于 ${new Date(publication.published_at!).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}。`
@@ -150,6 +166,7 @@ export default function Page() {
       <div className="breadcrumb">研究工作台 <span>/</span> 宽基指数 <span>/</span> <b>{current.short_name}</b></div>
       <div className="page-heading"><div><div className="eyebrow">A LONGER VIEW OF THE MARKET</div><h1>用因子，理解市场的脉络<span>。</span></h1><p>从完整历史到当下信号，让每一个判断都有据可循。</p></div><button className="outline-button" onClick={refreshData} disabled={loading || !!syncing}><RefreshCw size={14} className={syncing ? "spin" : ""} />{syncing ? (publishedMode ? "读取中…" : "同步中…") : publishedMode ? "刷新结果" : "刷新数据"}</button></div>
       {(updateMessage || updateError) && <div className="update-status" role="status" aria-live="polite"><p>{updateError || updateMessage}</p>{!syncing && update?.job?.details.errors?.map((item, i) => <p className="negative" key={i}>{defaults.find(d => d.code === item.index)?.short_name || item.index}：{item.error}</p>)}</div>}
+      {!publishedMode && update && <SyncProgress update={update} stopping={stoppingUpdate} onStop={stopSync} />}
       <section className="workspace" aria-label="指数与研究参数">
         <div className="index-tabs" role="tablist" aria-label="选择指数">{defaults.map(i => <button role="tab" aria-selected={code === i.code} key={i.code} className={code === i.code ? "active" : ""} onClick={() => setCode(i.code)}><span>{i.short_name}</span><small>{i.code}</small>{code === i.code && <span className="tab-indicator" />}</button>)}</div>
       <div className="research-controls"><div><span className="control-label">预测期限</span><div className="horizon-selector">{[1, 5, 10, 20, 60].map(h => <button key={h} aria-pressed={horizon === h} className={horizon === h ? "active" : ""} onClick={() => setHorizon(h)}>{h}日</button>)}</div></div><label className="range-control"><span className="control-label">图表区间</span><select value={range} onChange={e => setRange(e.target.value)}><option value="all">全部历史</option><option value="10">近10年</option><option value="5">近5年</option><option value="3">近3年</option><option value="1">近1年</option></select></label><span className="research-mode"><span className="small-dot" />时间序列 Rank IC</span></div>

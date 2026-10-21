@@ -13,7 +13,7 @@ from .db import SessionLocal
 from .factor_analysis import web_analysis
 from .models import Assessment, Bar, Evaluation, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot, FactorInput, MacroObservation, ValuationObservation
 from .pipeline import seed
-from .updates import UpdateBusy, start_update, update_status
+from .updates import UpdateBusy, start_update, stop_update, update_status
 
 
 @asynccontextmanager
@@ -187,3 +187,11 @@ def admin_config():
     # Never return credentials, even to authenticated callers.
     return {"tushare_configured": bool(os.getenv("TUSHARE_TOKEN")), "remote_updates": bool(os.getenv("ADMIN_TOKEN")),
         "update_command": "python -m backend.app.cli update"}
+
+
+@app.post("/api/v1/updates/{run_id}/stop", status_code=202, dependencies=[Depends(require_update_access)])
+def cancel_update(run_id: str):
+    try:
+        return stop_update(run_id)
+    except UpdateBusy as exc:
+        raise HTTPException(409, str(exc)) from None

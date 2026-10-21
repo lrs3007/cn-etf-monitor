@@ -56,6 +56,25 @@ test("a reported write without a durable object must never switch manifest", asy
   await assert.rejects(publishResults(s, f.manifest, async () => f.data), /not durable/);
   assert.equal(s.values.has("manifest"), false);
 });
+test("progress counts durable objects and bytes, including reused objects", async () => {
+  const s = store(), f = fixture(), events = [];
+  s.values.set(Object.values(f.manifest.objects)[0].key, f.data);
+  await publishResults(s, f.manifest, async () => f.data, (done, total, extra) => events.push({ done, total, ...extra }));
+  assert.deepEqual(events.map(e => e.done), [0, 1, 1]);
+  assert.equal(events[1].completed_bytes, f.data.byteLength);
+  assert.equal(events[1].total_bytes, f.data.byteLength);
+  assert.equal(events.at(-1).phase, "finalize");
+});
+test("cancelling after uploads retains old manifest and allows retry", async () => {
+  const s = store(), f = fixture(), previous = { export_id: "b".repeat(64) };
+  s.values.set("manifest", previous);
+  let cancelled = false;
+  await assert.rejects(publishResults(s, f.manifest, async () => f.data,
+    (done, total) => { if (done === total) cancelled = true; },
+    async () => { if (cancelled) throw new Error("cancelled"); }), /cancelled/);
+  assert.equal(s.values.get("manifest"), previous);
+  assert.equal((await publishResults(s, f.manifest, async () => f.data)).changed, true);
+});
 test("public endpoint is read-only, validates keys and caches only immutable objects", async () => {
   const s = store(), f = fixture(), key = Object.values(f.manifest.objects)[0].key;
   s.values.set("manifest", f.manifest); s.values.set(key, new Uint8Array(f.data).buffer);

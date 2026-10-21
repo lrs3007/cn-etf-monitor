@@ -12,6 +12,7 @@ from .evaluation import build_assessment, evaluate_factor, finite, forward_retur
 from .factors import REGISTRY, calculate_all
 from .models import Assessment, Bar, Evaluation, FactorDefinition, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot, MacroSeries, MacroObservation, ValuationObservation, FactorInput
 from .providers import full_history
+from .job_control import check_cancelled, job_started_at, report_progress
 
 
 def _stored_research_inputs(session, snapshot_id):
@@ -80,6 +81,7 @@ def bulk(session, model, rows, chunk=2000):
 
 
 def process_index(spec, offline=False, force=False, bond_context=None):
+    report_progress("collect_index", f"{spec.short_name}：采集并核对历史数据", index=spec.code)
     print(f"[{spec.short_name}] 获取全部历史…", flush=True)
     frame, coverage = full_history(spec, offline=offline, bond_context=bond_context)
     lineage = frame.attrs.get("spread_inputs", {"inputs": [], "valuations": [], "bonds": []})
@@ -107,13 +109,16 @@ def process_index(spec, offline=False, force=False, bond_context=None):
                 raise ValueError("股债收益差覆盖倒退，保留原快照；检查国债或PE数据源")
     print(f"[{spec.short_name}] {len(frame)}日，{frame.date.iloc[0]} → {frame.date.iloc[-1]}；计算{len(REGISTRY)}因子全历史…", flush=True)
     factors = calculate_all(frame)
+    check_cancelled()
     snapshot_id = uuid.uuid4().hex
     coverage["factor_definitions"] = metadata
     coverage["factor_coverage"] = {}
     all_horizons = sorted({h for key in factors for h in factor_horizons(key)})
     evaluations = {h: {} for h in all_horizons}
     rolling_rows = []
+    done, total = 0, sum(len(factor_horizons(key)) for key in factors)
     for key, (values, status) in factors.items():
+        check_cancelled()
         valid = values.notna()
         coverage["factor_coverage"][key] = {"total": len(values), "valid": int(valid.sum()),
             "warmup": int((status == "warmup").sum()), "missing": int((status == "missing_source").sum()),
@@ -121,17 +126,22 @@ def process_index(spec, offline=False, force=False, bond_context=None):
             "first_valid": frame.loc[valid, "date"].iloc[0] if valid.any() else None,
             "last_valid": frame.loc[valid, "date"].iloc[-1] if valid.any() else None}
         for h in factor_horizons(key):
+            report_progress("calculate", f"{spec.short_name}：{metadata[key]['name']} · {h}日检验", done, total, "项检验", index=spec.code)
             evaluation, rolling = evaluate_factor(frame, values, h, spec.launch_date, key)
+            done += 1
             evaluations[h][key] = evaluation
             for row in rolling:
                 rolling_rows.append({"snapshot_id": snapshot_id, "factor_id": key, "horizon": h, **row})
         print(f"[{spec.short_name}] {key}: {int(valid.sum())}/{len(frame)}", flush=True)
     from .diagnostics import diagnose_all
+    report_progress("diagnostics", f"{spec.short_name}：增量预测与方向稳定性检验", done, total, "项检验", index=spec.code)
     diagnostics = diagnose_all(frame, factors, spec.launch_date)
+    check_cancelled()
     for h in all_horizons:
         for key in evaluations[h]:
             evaluations[h][key]["predictive_diagnostics"] = diagnostics[key]
     # Publication is one transaction. Readers keep seeing the previous complete snapshot until commit.
+    report_progress("save", f"{spec.short_name}：保存完整历史快照", index=spec.code)
     with SessionLocal.begin() as session:
         session.add(Snapshot(id=snapshot_id, index_code=spec.code, created_at=now_iso(), engine_version=ENGINE_VERSION,
             dataset_hash=dataset_hash, status="published", coverage=coverage))
@@ -169,6 +179,7 @@ def process_index(spec, offline=False, force=False, bond_context=None):
         bulk(session, RollingEvaluation, rolling_rows)
         session.get(MarketIndex, spec.code).active_snapshot = snapshot_id
     print(f"[{spec.short_name}] 已发布 {snapshot_id}", flush=True)
+    check_cancelled()
     return {"index": spec.code, "snapshot": snapshot_id, "status": "published", "rows": len(frame),
         "first_date": frame.date.iloc[0], "last_date": frame.date.iloc[-1], "warnings": coverage["provider_errors"]}
 
@@ -181,15 +192,18 @@ def run_pipeline(specs=INDICES, offline=False, force=False, run_id=None):
         if job:
             job.status = "running"
         else:
-            session.add(JobRun(id=run_id, started_at=now_iso(), status="running", details={"indices": [s.code for s in specs]}))
+            session.add(JobRun(id=run_id, started_at=job_started_at(), status="running", details={"indices": [s.code for s in specs]}))
     results, errors = [], []
     from .equity_bond import load_bond_history
     print("[国债] 获取中债10年期国债收益率历史…", flush=True)
+    report_progress("collect_bonds", "采集中债10年期国债收益率历史")
     bond_context = load_bond_history(offline=offline, force=force)
+    check_cancelled()
     print(f"[国债] {len(bond_context['observations'])}条观测，{len(bond_context['errors'])}条源提示", flush=True)
     for spec in specs:
         with SessionLocal.begin() as session:
-            session.get(JobRun, run_id).details = {"indices": [s.code for s in specs],
+            job = session.get(JobRun, run_id)
+            job.details = {**job.details, "indices": [s.code for s in specs],
                 "active_index": spec.code, "results": list(results), "errors": list(errors)}
         try:
             results.append(process_index(spec, offline=offline, force=force, bond_context=bond_context))
@@ -198,11 +212,12 @@ def run_pipeline(specs=INDICES, offline=False, force=False, run_id=None):
             traceback.print_exc()
             errors.append({"index": spec.code, "error": str(exc)})
         with SessionLocal.begin() as session:
-            session.get(JobRun, run_id).details = {"indices": [s.code for s in specs],
+            job = session.get(JobRun, run_id)
+            job.details = {**job.details, "indices": [s.code for s in specs],
                 "results": list(results), "errors": list(errors)}
     with SessionLocal.begin() as session:
         job = session.get(JobRun, run_id)
         job.finished_at = now_iso()
         job.status = "partial" if errors and results else "failed" if errors else "completed"
-        job.details = {"results": results, "errors": errors}
+        job.details = {**job.details, "results": results, "errors": errors}
     return {"run_id": run_id, "results": results, "errors": errors}
