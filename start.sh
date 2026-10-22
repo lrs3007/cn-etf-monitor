@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p data/logs data/run
+CN_MONITOR_STOP_PIDS=()
 for CN_MONITOR_SERVICE in api web scheduler; do
   CN_MONITOR_PIDFILE="data/run/$CN_MONITOR_SERVICE.pid"
   if [ -f "$CN_MONITOR_PIDFILE" ]; then
@@ -18,13 +19,18 @@ for CN_MONITOR_SERVICE in api web scheduler; do
         exit 1
       fi
       case "$CN_MONITOR_COMMAND" in
-        *"uvicorn backend.app.api:app"*|*"next-server"*|*"next/dist/bin/next start"*|*"backend.app.scheduler"*) kill "$CN_MONITOR_PID" ;;
+        *"uvicorn backend.app.api:app"*|*"next-server"*|*"next/dist/bin/next start"*|*"backend.app.scheduler"*) CN_MONITOR_STOP_PIDS+=("$CN_MONITOR_PID") ;;
         *) echo "PID不是本项目服务，拒绝结束进程"; exit 1 ;;
       esac
     fi
   fi
 done
-if [ "${1:-}" = "--restart" ]; then sleep 1; fi
+if [ "${1:-}" = "--restart" ]; then
+  # Validate all owners before stopping any: the previous supervisor may stop
+  # its remaining services as soon as the first service exits.
+  for CN_MONITOR_PID in "${CN_MONITOR_STOP_PIDS[@]}"; do kill "$CN_MONITOR_PID" 2>/dev/null || true; done
+  sleep 1
+fi
 if [ ! -x .venv/bin/python ]; then
   echo "请先创建Python环境并安装 requirements.txt"
   exit 1

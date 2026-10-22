@@ -56,6 +56,48 @@ test("a reported write without a durable object must never switch manifest", asy
   await assert.rejects(publishResults(s, f.manifest, async () => f.data), /not durable/);
   assert.equal(s.values.has("manifest"), false);
 });
+test("previously published hashes reuse without remote HEAD/PUT but still validate local bytes", async () => {
+  const s = store(), f = fixture(), events = [];
+  s.values.set("manifest", { ...f.manifest, export_id: "b".repeat(64) });
+  s.set = s.getMetadata = async () => { throw new Error("redundant network call"); };
+  await publishResults(s, f.manifest, async () => f.data, (_, __, e) => events.push(e));
+  assert.equal(events.at(-1).reused, 1);
+  assert.equal(events.at(-1).uploaded_bytes, 0);
+  s.values.set("manifest", { ...f.manifest, export_id: "b".repeat(64) });
+  await assert.rejects(publishResults(s, f.manifest, async () => Buffer.from("bad")), /checksum/);
+});
+test("durable journal supports retry after an interrupted release without repeating remote requests", async () => {
+  const s = store(), f = fixture(), verified = new Set();
+  let saved = 0;
+  s.setJSON = async () => { throw new Error("manifest interrupted"); };
+  await assert.rejects(publishResults(s, f.manifest, async () => f.data, undefined, undefined, 2, verified, async () => saved++), /manifest interrupted/);
+  assert.equal(saved, 1); assert.equal(verified.size, 1);
+  s.set = s.getMetadata = async () => { throw new Error("must reuse verified journal"); };
+  s.setJSON = async (key, value) => { s.values.set(key, value); return { modified: true }; };
+  const result = await publishResults(s, f.manifest, async () => f.data, undefined, undefined, 2, verified);
+  assert.equal(result.uploaded, 0); assert.equal(result.reused, 1);
+});
+test("worker queue continues while the first upload is slow and limits in-flight writes", async () => {
+  const s = store(), manifest = { schema_version: 2, export_id: "a".repeat(64), objects: {} }, data = new Map();
+  for (let i = 0; i < 6; i++) {
+    const body = gzipSync(Buffer.from(String(i))), sha256 = createHash("sha256").update(body).digest("hex"), key = `objects/${sha256}.json.gz`;
+    manifest.objects[i] = { key, sha256, bytes: body.byteLength }; data.set(key, body);
+  }
+  const first = Object.values(manifest.objects)[0].key;
+  let release, active = 0, maximum = 0, count = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const timer = setTimeout(() => release(), 1000);
+  const write = s.set;
+  s.set = async (key, ...args) => {
+    active++; maximum = Math.max(maximum, active); count++;
+    if (count === 4) release();
+    if (key === first) { await gate; assert.ok(count >= 4, "slow first object stalled queue"); }
+    const result = await write(key, ...args); active--; return result;
+  };
+  try { await publishResults(s, manifest, key => data.get(key), undefined, undefined, 2); }
+  finally { clearTimeout(timer); }
+  assert.equal(maximum, 2); assert.equal(s.writes.at(-1), "manifest");
+});
 test("progress counts durable objects and bytes, including reused objects", async () => {
   const s = store(), f = fixture(), events = [];
   s.values.set(Object.values(f.manifest.objects)[0].key, f.data);
@@ -91,12 +133,13 @@ test("public endpoint is read-only, validates keys and caches only immutable obj
   assert.equal((await serveResults(request("manifest", "HEAD"), s)).body, null);
 });
 
-test("browser adapter preserves nulls, horizon and pinned release across refresh", async () => {
+for (const schema of [1, 2]) test(`browser adapter schema ${schema} preserves nulls, horizon and pinned release across refresh`, async () => {
   const originalFetch = globalThis.fetch, originalMode = process.env.NEXT_PUBLIC_DATA_MODE;
   process.env.NEXT_PUBLIC_DATA_MODE = "published";
   let version = 1, failManifest = false, manifestRequests = 0;
-  const manifest = v => ({ schema_version: 1, export_id: `release${v}`, published_at: "2026-10-19", indices: [], objects: {
+  const manifest = v => ({ schema_version: schema, export_id: `release${v}`, published_at: "2026-10-19", indices: [], objects: {
     "index/test": { key: `index${v}` }, [`factor/s${v}/spread`]: { key: `factor${v}` },
+    "prices/test/2026": { key: `prices${v}` }, "research/test/2026": { key: `research${v}` },
   } });
   globalThis.fetch = async input => {
     const key = new URL(input, "https://test").searchParams.get("key");
@@ -106,9 +149,15 @@ test("browser adapter preserves nulls, horizon and pinned release across refresh
       return Response.json(manifest(version));
     }
     const v = Number(key.slice(-1));
-    if (key.startsWith("index")) return Response.json({ code: "test", snapshot_id: `s${v}`, updated_at: "2026-10-19",
+    const prices = [{ date: "2026-10-16", close: 100 }, { date: "2026-10-19", close: 101 }];
+    const analysis = { analysis_version: "position-match-v1", as_of: `release${v}`, current: v, outcomes: [{ horizon: 252 }] };
+    if (key.startsWith("prices")) return Response.json({ prices, returns: { "252": [.12, null] } });
+    if (key.startsWith("research")) return Response.json({ dates: prices.map(p => p.date), factors: {
+      spread: { values: [[null, "missing_source"], [v, "valid"]], rolling: { "252": [] } } } });
+    if (key.startsWith("index")) return Response.json({
+      ...(schema === 2 ? { price_chunks: ["prices/test/2026"], research_chunks: ["research/test/2026"], analyses: { spread: analysis } } : {}), code: "test", snapshot_id: `s${v}`, updated_at: "2026-10-19",
       prices: [{ date: "2026-10-16", close: 100 }, { date: "2026-10-19", close: 101 }],
-      coverage: { factor_coverage: { spread: { valid: 1 } } }, definitions: { spread: { id: "spread" } },
+      coverage: { rows: 2, last_date: "2026-10-19", factor_coverage: { spread: { valid: 1 } } }, definitions: { spread: { id: "spread" } },
       evaluations: { spread: { "20": { horizon: 20 }, "252": { horizon: 252 } } },
       assessments: { "20": { label: "test" } }, returns: { "252": [.12, null] } });
     return Response.json({ snapshot_id: `s${v}`, values: [[null, "missing_source"], [v, "valid"]], rolling: { "252": [] }, components: [],
@@ -117,7 +166,7 @@ test("browser adapter preserves nulls, horizon and pinned release across refresh
   try {
     const source = await readFile(new URL("../lib/data-api.ts", import.meta.url), "utf8");
     const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
-    const api = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
+    const api = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}#schema${schema}`);
     const dashboard = await api.readDashboard("test", 20);
     assert.equal((await api.checkPublication()).changed, false);
     version = 2;
@@ -144,4 +193,36 @@ test("browser adapter preserves nulls, horizon and pinned release across refresh
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.NEXT_PUBLIC_DATA_MODE; else process.env.NEXT_PUBLIC_DATA_MODE = originalMode;
   }
+});
+
+test("same-snapshot republication preserves each dashboard's release binding and retries transient chunk failures", async () => {
+  const originalFetch = globalThis.fetch, originalMode = process.env.NEXT_PUBLIC_DATA_MODE;
+  process.env.NEXT_PUBLIC_DATA_MODE = "published";
+  let version = 1, failedOnce = false;
+  globalThis.fetch = async input => {
+    const key = new URL(input, "https://test").searchParams.get("key");
+    if (key === "manifest") return Response.json({ schema_version: 2, export_id: `v${version}`, indices: [], published_at: String(version), objects: {
+      "index/test": { key: `index${version}` }, price: { key: "price" }, research: { key: "research" },
+    } });
+    if (key === "price") {
+      if (!failedOnce) { failedOnce = true; throw new TypeError("temporary connection reset"); }
+      return Response.json({ prices: [{ date: "2026-10-22", close: 100 }], returns: { "20": [null] } });
+    }
+    if (key === "research") return Response.json({ dates: ["2026-10-22"], factors: { test: { values: [[1, "ok"]], rolling: { "20": [] } } } });
+    const v = Number(key.at(-1));
+    return Response.json({ code: "test", snapshot_id: "same", coverage: { rows: 1, last_date: "2026-10-22", factor_coverage: { test: {} } },
+      definitions: { test: { id: "test" } }, evaluations: { test: { "20": {} } }, assessments: { "20": { label: `version${v}` } },
+      price_chunks: ["price"], research_chunks: ["research"], analyses: { test: { current: v } } });
+  };
+  try {
+    const source = await readFile(new URL("../lib/data-api.ts", import.meta.url), "utf8");
+    const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+    const api = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}#same-snapshot`);
+    const first = await api.readDashboard("test", 20);
+    version = 2; await api.refreshPublication();
+    const second = await api.readDashboard("test", 20);
+    assert.equal(second.assessment.label, "version2");
+    assert.equal((await api.readFactor("test", "test", 20, "same", undefined, first.publication_id)).analysis.current, 1);
+    assert.equal((await api.readFactor("test", "test", 20, "same", undefined, second.publication_id)).analysis.current, 2);
+  } finally { globalThis.fetch = originalFetch; if (originalMode === undefined) delete process.env.NEXT_PUBLIC_DATA_MODE; else process.env.NEXT_PUBLIC_DATA_MODE = originalMode; }
 });

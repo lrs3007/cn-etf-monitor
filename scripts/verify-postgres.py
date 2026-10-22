@@ -19,11 +19,17 @@ from sqlalchemy.orm import sessionmaker
 from backend.app.config import DATA_DIR, INDICES, ROOT
 from backend.app.db import Base, SessionLocal, engine as source_engine
 from backend.app.models import Evaluation, MarketIndex, Snapshot
+from backend.app.factors import REGISTRY
 
 
 def main():
     with SessionLocal() as session:
         active = session.scalars(select(MarketIndex.active_snapshot).where(MarketIndex.active_snapshot.is_not(None))).all()
+        dependencies = set(active)
+        for snapshot in session.scalars(select(Snapshot).where(Snapshot.id.in_(active))):
+            for horizons in snapshot.coverage.get("rolling_sources", {}).values():
+                for sources in horizons.values():
+                    dependencies.update(sources)
     if len(active) != len(INDICES):
         raise SystemExit("请先完成五个指数的历史回填")
     with tempfile.TemporaryDirectory(prefix="cn-etf-pgqa-", dir=DATA_DIR) as directory:
@@ -38,9 +44,9 @@ def main():
                     for table in Base.metadata.sorted_tables:
                         query = select(table)
                         if table.name == "data_snapshots":
-                            query = query.where(table.c.id.in_(active))
+                            query = query.where(table.c.id.in_(dependencies))
                         elif "snapshot_id" in table.c:
-                            query = query.where(table.c.snapshot_id.in_(active))
+                            query = query.where(table.c.snapshot_id.in_(dependencies))
                         columns = ", ".join(f'"{col.name}"' for col in table.columns)
                         json_columns = [isinstance(col.type, JSON) for col in table.columns]
                         count = 0
@@ -68,7 +74,7 @@ def main():
                     response = client.get(f"/api/v1/dashboard/{spec.code}?horizon=20")
                     assert response.status_code == 200, response.text[:300]
                     dashboard = response.json()
-                    assert len(dashboard["factors"]) == 19
+                    assert len(dashboard["factors"]) == len(REGISTRY)
                     assert len(dashboard["prices"]) == dashboard["coverage"]["rows"]
                     response = client.get(f"/api/v1/indices/{spec.code}/factors/momentum_20?horizon=60")
                     assert response.status_code == 200

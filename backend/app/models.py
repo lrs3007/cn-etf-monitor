@@ -137,3 +137,23 @@ class FactorInput(Base):
     trade_date: Mapped[str] = mapped_column(String(10), primary_key=True)
     valuation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("valuation_observations.id"))
     bond_id: Mapped[Optional[str]] = mapped_column(ForeignKey("macro_observations.id"))
+
+
+class ResearchObservation(Base):
+    __tablename__ = "research_observations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    index_code: Mapped[str] = mapped_column(ForeignKey("market_indices.code"), index=True)
+    instrument_code: Mapped[str] = mapped_column(String(16))
+    group: Mapped[str] = mapped_column(String(20))
+    observation_date: Mapped[str] = mapped_column(String(10), index=True)
+    available_date: Mapped[str] = mapped_column(String(10))
+    values: Mapped[dict] = mapped_column(JSON)
+    provenance: Mapped[dict] = mapped_column(JSON)
+
+
+class ResearchInput(Base):
+    __tablename__ = "research_inputs"
+    snapshot_id: Mapped[str] = mapped_column(ForeignKey("data_snapshots.id"), primary_key=True)
+    factor_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    trade_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+    observation_id: Mapped[str] = mapped_column(ForeignKey("research_observations.id"))

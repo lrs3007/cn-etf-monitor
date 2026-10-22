@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import func, select
 from backend.app.config import HORIZONS, INDICES, SPREAD_FACTOR
 from backend.app.db import SessionLocal
-from backend.app.models import Bar, FactorValue, ForwardReturn, MarketIndex, Snapshot, FactorInput, MacroObservation, ValuationObservation
+from backend.app.models import Bar, FactorValue, ForwardReturn, MarketIndex, Snapshot, FactorInput, MacroObservation, ValuationObservation, ResearchInput, ResearchObservation
 
 
 def main():
@@ -52,6 +52,22 @@ def main():
                         assert abs(value.value - (100 / pe.pe_ttm - bond.value)) < 1e-10
                         spread_checked += 1
                 assert spread_checked == snapshot.coverage["factor_coverage"][SPREAD_FACTOR]["valid"]
+            external_checked = 0
+            external = session.execute(select(ResearchInput, ResearchObservation, FactorValue)
+                .join(ResearchObservation, ResearchInput.observation_id == ResearchObservation.id)
+                .join(FactorValue, (FactorValue.snapshot_id == ResearchInput.snapshot_id)
+                    & (FactorValue.factor_id == ResearchInput.factor_id) & (FactorValue.trade_date == ResearchInput.trade_date))
+                .where(ResearchInput.snapshot_id == sid)).all()
+            positions = {day: i for i, day in enumerate(dates)}
+            for link, observation, value in external:
+                assert observation.index_code == spec.code
+                assert dates[positions[link.trade_date] - 1] == observation.observation_date < link.trade_date
+                assert observation.available_date <= link.trade_date
+                if value.value is not None:
+                    assert abs(value.value - observation.values[link.factor_id]) < 1e-10
+                    external_checked += 1
+            expected_external = sum(c["valid"] for fid, c in snapshot.coverage["factor_coverage"].items() if definitions[fid].get("source_group"))
+            assert external_checked == expected_external
             if reference is None:
                 reference = set(dates)
             expected = {d for d in reference if dates[0] <= d <= dates[-1]}
@@ -61,6 +77,7 @@ def main():
                 "amount_rows": snapshot.coverage["amount_rows"], "valuation_rows": snapshot.coverage["valuation_rows"],
                 "backcast_rows": snapshot.coverage["backcast_rows"], "snapshot_id": sid})
             report[-1]["spread_input_rows_verified"] = spread_checked
+            report[-1]["external_input_rows_verified"] = external_checked
     output = {"checks": "passed", "indices": report, "total_bars": sum(r["rows"] for r in report),
         "total_factor_rows": sum(r["factor_rows"] for r in report),
         "calendar_note": "指数间逐日交叉检查，不等于独立交易所日历认证"}

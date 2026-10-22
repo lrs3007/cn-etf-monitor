@@ -10,7 +10,7 @@ from .config import DATA_DIR, ENGINE_VERSION, HORIZONS, INDICES, SPREAD_FACTOR, 
 from .db import SessionLocal, init_db
 from .evaluation import build_assessment, evaluate_factor, finite, forward_returns
 from .factors import REGISTRY, calculate_all
-from .models import Assessment, Bar, Evaluation, FactorDefinition, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot, MacroSeries, MacroObservation, ValuationObservation, FactorInput
+from .models import Assessment, Bar, Evaluation, FactorDefinition, FactorValue, ForwardReturn, JobRun, MarketIndex, RollingEvaluation, Snapshot, MacroSeries, MacroObservation, ValuationObservation, FactorInput, ResearchObservation, ResearchInput
 from .providers import full_history
 from .job_control import check_cancelled, job_started_at, report_progress
 
@@ -77,19 +77,38 @@ def seed():
 
 def bulk(session, model, rows, chunk=2000):
     for start in range(0, len(rows), chunk):
-        session.execute(insert(model), rows[start:start + chunk])
+        # All mappings have explicit columns/nulls. Core executemany avoids ORM
+        # regrouping and per-row bookkeeping for historical numeric series.
+        session.execute(insert(model.__table__), rows[start:start + chunk])
 
 
-def process_index(spec, offline=False, force=False, bond_context=None):
+def process_index(spec, offline=False, force=False, bond_context=None, research_context=None):
     report_progress("collect_index", f"{spec.short_name}：采集并核对历史数据", index=spec.code)
     print(f"[{spec.short_name}] 获取全部历史…", flush=True)
-    frame, coverage = full_history(spec, offline=offline, bond_context=bond_context)
+    from .provider_cache import history_audit
+    with history_audit(force):
+        frame, coverage = full_history(spec, offline=offline, bond_context=bond_context)
     lineage = frame.attrs.get("spread_inputs", {"inputs": [], "valuations": [], "bonds": []})
     if len(frame) < 60:
         raise ValueError("历史少于60个交易日，拒绝替换已有数据")
+    research = {"observations": [], "inputs": [], "logical": [], "sources": {}, "warnings": []}
+    if research_context is not None:
+        from .etf_research import align_research
+        frame, research = align_research(frame, spec, research_context, offline)
+        coverage["provider_errors"].extend(research["warnings"])
     metadata = {key: definition.metadata() for key, definition in REGISTRY.items()}
-    dataset_hash = hashlib.sha256((frame.to_csv(index=False) + json.dumps(metadata, sort_keys=True)
-        + json.dumps(lineage["inputs"], sort_keys=True) + ENGINE_VERSION).encode()).hexdigest()
+    # Raw response hashes may change without any observation changing (e.g. page
+    # timestamps). Keep their original audit records without duplicating research.
+    valuations = {row["id"]: row for row in lineage["valuations"]}
+    bonds = {row["id"]: row for row in lineage["bonds"]}
+    logical_inputs = []
+    for row in lineage["inputs"]:
+        pe, bond = valuations.get(row.get("valuation_id")), bonds.get(row.get("bond_id"))
+        logical_inputs.append({"factor_id": row["factor_id"], "trade_date": row["trade_date"],
+            "valuation": {k: pe[k] for k in ("index_code", "observation_date", "available_date", "pe_ttm")} if pe else None,
+            "bond": {k: bond[k] for k in ("series_id", "observation_date", "available_date", "value")} if bond else None})
+    dataset_hash = hashlib.sha256(("research-inputs-v2" + frame.drop(columns=["pe_record"], errors="ignore").to_csv(index=False)
+        + json.dumps(metadata, sort_keys=True) + json.dumps(logical_inputs, sort_keys=True) + json.dumps(research["logical"], sort_keys=True) + ENGINE_VERSION).encode()).hexdigest()
     with SessionLocal() as session:
         market = session.get(MarketIndex, spec.code)
         previous = session.get(Snapshot, market.active_snapshot) if market.active_snapshot else None
@@ -109,10 +128,26 @@ def process_index(spec, offline=False, force=False, bond_context=None):
                 raise ValueError("股债收益差覆盖倒退，保留原快照；检查国债或PE数据源")
     print(f"[{spec.short_name}] {len(frame)}日，{frame.date.iloc[0]} → {frame.date.iloc[-1]}；计算{len(REGISTRY)}因子全历史…", flush=True)
     factors = calculate_all(frame)
+    if previous:
+        for fid in research["sources"]:
+            prior = previous.coverage["factor_coverage"].get(fid, {})
+            # A deliberate representative-fund change starts a different source
+            # history; ordinary refreshes of the same fund cannot erase coverage.
+            same_instrument = prior.get("source", {}).get("instrument_code") == research["sources"][fid]["instrument_code"]
+            if same_instrument and int(factors[fid][0].notna().sum()) < prior.get("valid", 0):
+                raise ValueError(f"{fid}历史覆盖倒退，保留原快照；请检查ETF或宽度数据源")
+    from .incremental import EvaluationMemo, reusable_rolling
+    memo = EvaluationMemo(DATA_DIR / "compute-cache" / f"{spec.code}.json", force=force)
+    with SessionLocal() as session:
+        cached_rolling, cache_reason = reusable_rolling(session, previous, frame, factors, metadata, spec.launch_date) if not force else ({}, "forced_full")
+    print(f"[{spec.short_name}] 滚动IC缓存：{len(cached_rolling)}组；{cache_reason}", flush=True)
+    coverage["computation"] = {"rolling_cache_groups": len(cached_rolling), "cache_reason": cache_reason,
+        "policy": "validate_entire_prefix_else_recompute; full_current_IC_CI_and_diagnostics"}
     check_cancelled()
     snapshot_id = uuid.uuid4().hex
     coverage["factor_definitions"] = metadata
     coverage["factor_coverage"] = {}
+    coverage["rolling_sources"] = {}
     all_horizons = sorted({h for key in factors for h in factor_horizons(key)})
     evaluations = {h: {} for h in all_horizons}
     rolling_rows = []
@@ -125,14 +160,27 @@ def process_index(spec, offline=False, force=False, bond_context=None):
             "undefined": int((status == "undefined").sum()),
             "first_valid": frame.loc[valid, "date"].iloc[0] if valid.any() else None,
             "last_valid": frame.loc[valid, "date"].iloc[-1] if valid.any() else None}
+        if key in research["sources"]:
+            coverage["factor_coverage"][key]["source"] = research["sources"][key]
         for h in factor_horizons(key):
             report_progress("calculate", f"{spec.short_name}：{metadata[key]['name']} · {h}日检验", done, total, "项检验", index=spec.code)
-            evaluation, rolling = evaluate_factor(frame, values, h, spec.launch_date, key)
+            evaluation, rolling = evaluate_factor(frame, values, h, spec.launch_date, key,
+                previous_rolling=cached_rolling.get((key, h)), memo=memo)
             done += 1
             evaluations[h][key] = evaluation
-            for row in rolling:
+            cached = cached_rolling.get((key, h), [])
+            delta = rolling[len(cached):]
+            if cached:
+                from .research_store import rolling_sources
+                sources = list(rolling_sources(previous, key, h))
+                if delta:
+                    sources.append(snapshot_id)
+                coverage["rolling_sources"].setdefault(key, {})[str(h)] = sources
+            for row in delta:
                 rolling_rows.append({"snapshot_id": snapshot_id, "factor_id": key, "horizon": h, **row})
         print(f"[{spec.short_name}] {key}: {int(valid.sum())}/{len(frame)}", flush=True)
+    memo.save()
+    coverage["computation"].update({"closed_fold_hits": memo.hits, "closed_fold_misses": memo.misses})
     from .diagnostics import diagnose_all
     report_progress("diagnostics", f"{spec.short_name}：增量预测与方向稳定性检验", done, total, "项检验", index=spec.code)
     diagnostics = diagnose_all(frame, factors, spec.launch_date)
@@ -155,6 +203,11 @@ def process_index(spec, offline=False, force=False, bond_context=None):
                 existing = set(session.scalars(select(model.id)))
                 bulk(session, model, [row for row in rows if row["id"] not in existing])
         session.flush()
+        if research["observations"]:
+            existing = set(session.scalars(select(ResearchObservation.id).where(ResearchObservation.index_code == spec.code)))
+            bulk(session, ResearchObservation, [row for row in research["observations"] if row["id"] not in existing])
+            session.flush()
+            bulk(session, ResearchInput, [{"snapshot_id": snapshot_id, **row} for row in research["inputs"]])
         bulk(session, FactorInput, [{"snapshot_id": snapshot_id, **row} for row in lineage["inputs"]])
         bars = []
         for row in frame.to_dict("records"):
@@ -200,13 +253,15 @@ def run_pipeline(specs=INDICES, offline=False, force=False, run_id=None):
     bond_context = load_bond_history(offline=offline, force=force)
     check_cancelled()
     print(f"[国债] {len(bond_context['observations'])}条观测，{len(bond_context['errors'])}条源提示", flush=True)
+    from .etf_sources import prepare_etf_context
+    research_context = prepare_etf_context(specs, offline=offline, force=force)
     for spec in specs:
         with SessionLocal.begin() as session:
             job = session.get(JobRun, run_id)
             job.details = {**job.details, "indices": [s.code for s in specs],
                 "active_index": spec.code, "results": list(results), "errors": list(errors)}
         try:
-            results.append(process_index(spec, offline=offline, force=force, bond_context=bond_context))
+            results.append(process_index(spec, offline=offline, force=force, bond_context=bond_context, research_context=research_context))
         except Exception as exc:
             import traceback
             traceback.print_exc()

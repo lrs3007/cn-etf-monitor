@@ -25,6 +25,35 @@ def observation(day, value=2.):
     return {"id": identity(payload), **payload}
 
 
+def test_bond_year_cache_reuses_closed_years_and_forced_audit_preserves_observations(tmp_path, monkeypatch):
+    from datetime import datetime
+    from backend.app import equity_bond, providers
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2004, 10, 22, 20, tzinfo=tz)
+    data = tmp_path / "data"
+    monkeypatch.setattr(equity_bond, "DATA_DIR", data)
+    monkeypatch.setattr(equity_bond, "datetime", Clock)
+    monkeypatch.setattr(providers, "DATA_DIR", data)
+    monkeypatch.setattr(providers, "ROOT", tmp_path)
+    calls = []
+    def fetch(url, params):
+        year = params["startDate"][:4]; calls.append(year)
+        return f'<table><tr><td>曲线名称</td><td>日期</td><td>10年</td></tr><tr><td>中债国债收益率曲线</td><td>{year}-01-02</td><td>3.1</td></tr></table>'
+    monkeypatch.setattr(providers, "fetch", fetch)
+    first = equity_bond.load_bond_history()
+    assert sorted(calls) == ["2002", "2003", "2004"]
+    calls.clear()
+    second = equity_bond.load_bond_history()
+    assert calls == ["2004"]
+    assert [r["id"] for r in first["observations"]] == [r["id"] for r in second["observations"]]
+    assert len(second["observations"]) == 3 and second["errors"] == []
+    calls.clear()
+    equity_bond.load_bond_history(force=True)
+    assert sorted(calls) == ["2002", "2003", "2004"]
+
+
 def valuation(day, pe=12.5, available=None):
     return {"date": day, "available_date": available or (date.fromisoformat(day) + timedelta(days=1)).isoformat(),
         "pe_ttm": pe, "source": "test", "availability_assumed": True}
@@ -143,9 +172,9 @@ def test_spread_snapshot_persists_lineage_and_long_horizon_api(tmp_path, monkeyp
             import json
             from backend.app.publication import export_results
             exported = export_results(tmp_path / "publication", sessions, (INDICES[0],))
-            key = exported["objects"][f"factor/{first['snapshot']}/{SPREAD_FACTOR}"]["key"]
+            key = exported["objects"]["index/000300.SH"]["key"]
             payload = json.loads(gzip.decompress((tmp_path / "publication" / key).read_bytes()))
-            assert payload["analysis"] == body["analysis"]
+            assert payload["analyses"][SPREAD_FACTOR] == body["analysis"]
             assert client.get("/api/v1/indices/000300.SH/factors/pe_ttm?horizon=252").status_code == 422
     finally:
         engine.dispose()

@@ -104,6 +104,19 @@ def completed_pipeline(sessions, run_id="web", errors=None):
     return {"run_id": run_id, **details}
 
 
+def test_publish_only_reuses_local_data_without_collection(isolated_updates, monkeypatch):
+    monkeypatch.setenv("CN_MONITOR_PUBLISH", "1")
+    with isolated_updates.begin() as s:
+        s.add(JobRun(id="retry", started_at="2026-10-22", status="queued", details={"mode": "publish_only"}))
+    monkeypatch.setattr(pipeline, "run_pipeline", lambda **kw: pytest.fail("publish-only must not collect or calculate"))
+    monkeypatch.setattr(updates, "publish_current_results", lambda: {"status": "published", "export_id": "retry"})
+    with updates.acquire_update_lock():
+        updates.run_web_update("retry")
+    status = updates.update_status()
+    assert not status["busy"] and status["job"]["status"] == "completed"
+    assert status["job"]["details"]["mode"] == "publish_only"
+
+
 @pytest.mark.parametrize("outcome", ["published", "unchanged", "failed"])
 def test_web_calculation_publishes_under_same_lock_and_preserves_local_results(isolated_updates, monkeypatch, outcome):
     monkeypatch.setenv("CN_MONITOR_PUBLISH", "1")

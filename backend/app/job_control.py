@@ -40,6 +40,21 @@ class JobControl:
         self.cancel_file = Path(directory) / "run" / f"cancel-{run_id}"
         self.last_write = 0
         self.stage = None
+        self.accounted_at = time.monotonic()
+        self.timings = {}
+
+    def account(self):
+        now = time.monotonic()
+        key = "collect" if self.stage and self.stage.startswith("collect_") else self.stage
+        if key and key not in ("completed", "failed", "cancelled"):
+            self.timings[key] = self.timings.get(key, 0) + now - self.accounted_at
+        self.accounted_at = now
+
+    def finish(self):
+        self.account()
+        with self.sessions.begin() as session:
+            if job := session.get(JobRun, self.run_id):
+                job.details = {**job.details, "timings": {k: round(v, 3) for k, v in self.timings.items()}}
 
     def check(self):
         if self.cancel_file.exists():
@@ -50,12 +65,13 @@ class JobControl:
         now = time.monotonic()
         if stage == self.stage and now - self.last_write < .3 and completed != total:
             return
+        self.account()
         progress = {"stage": stage, "label": label, "completed": completed, "total": total,
                     "unit": unit, "updated_at": now_iso(), **extra}
         with self.sessions.begin() as session:
             job = session.get(JobRun, self.run_id)
             if job:
-                job.details = {**job.details, "progress": progress}
+                job.details = {**job.details, "progress": progress, "timings": {k: round(v, 3) for k, v in self.timings.items()}}
         self.last_write, self.stage = now, stage
 
 
@@ -114,3 +130,4 @@ def control_job(run_id, *, sessions=SessionLocal, directory=DATA_DIR, install_si
             signal.signal(signum, handler)
         _control.reset(token)
         control.cancel_file.unlink(missing_ok=True)
+        control.finish()

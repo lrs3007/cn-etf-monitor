@@ -96,7 +96,8 @@ def run_publisher():
                             phase = item.get("phase", "upload")
                             report_progress(phase, "确认并切换完整网页版本" if phase == "finalize" else "核对并同步网页结果对象",
                                 item.get("completed"), item.get("total"), "个对象",
-                                completed_bytes=item.get("completed_bytes"), total_bytes=item.get("total_bytes"))
+                                completed_bytes=item.get("completed_bytes"), total_bytes=item.get("total_bytes"),
+                                uploaded=item.get("uploaded"), reused=item.get("reused"), uploaded_bytes=item.get("uploaded_bytes"))
                         elif line.strip():
                             receipt.append(line.decode())
             if buffer.strip():
@@ -113,11 +114,11 @@ def run_publisher():
     return SimpleNamespace(returncode=process.returncode, stdout="\n".join(receipt))
 
 
-def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
+def export_results(directory=None, session_factory=SessionLocal, specs=INDICES, snapshot_ids=None):
     root = Path(directory or DATA_DIR / "publication")
     objects = root / "objects"
     objects.mkdir(parents=True, exist_ok=True)
-    manifest = {"schema_version": 1, "indices": [], "objects": {}}
+    manifest = {"schema_version": 2, "indices": [], "objects": {}}
 
     def write(name, payload):
         data = gzip.compress(encoded(payload), compresslevel=6, mtime=0)
@@ -134,14 +135,16 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
         total_objects = 0
         for spec in specs:
             market = session.get(MarketIndex, spec.code)
-            snapshot = session.get(Snapshot, market.active_snapshot) if market and market.active_snapshot else None
+            target = (snapshot_ids or {}).get(spec.code) or (market.active_snapshot if market else None)
+            snapshot = session.get(Snapshot, target) if target else None
             if snapshot:
-                total_objects += 1 + len(snapshot.coverage["factor_definitions"])
+                total_objects += 2 + 2 * (int(snapshot.coverage["last_date"][:4]) - int(snapshot.coverage["first_date"][:4]) + 1)
         for spec in specs:
             check_cancelled()
             report_progress("export", f"{spec.short_name}：导出全历史与逐因子分析", len(manifest["objects"]), total_objects, "份结果")
             market = session.get(MarketIndex, spec.code)
-            snap = session.get(Snapshot, market.active_snapshot) if market and market.active_snapshot else None
+            target = (snapshot_ids or {}).get(spec.code) or (market.active_snapshot if market else None)
+            snap = session.get(Snapshot, target) if target else None
             if not snap or snap.status != "published" or snap.index_code != spec.code:
                 raise ValueError(f"{spec.code} 缺少可发布快照；请先完成回填")
             coverage = public_coverage(snap.coverage)
@@ -163,11 +166,20 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
                 if [r.trade_date for r in rows] != dates:
                     raise ValueError(f"{spec.code} {h}日收益序列缺失")
                 returns[str(h)] = [r.value for r in rows]
-            write(f"index/{spec.code}", {"code": spec.code, "snapshot_id": snap.id, "updated_at": snap.created_at,
+            index_payload = {"code": spec.code, "snapshot_id": snap.id, "updated_at": snap.created_at,
                 "coverage": coverage, "definitions": definitions, "evaluations": evaluations,
-                "assessments": {h: item.result for h, item in assessments.items()}, "returns": returns,
-                "prices": [{"date": b.trade_date, **{k: getattr(b, k) for k in
-                    ("open", "high", "low", "close", "volume", "amount", "history_type")}} for b in bars]})
+                "assessments": {h: item.result for h, item in assessments.items()},
+                "price_chunks": [], "research_chunks": [], "analyses": {}, "components_key": f"inputs/{spec.code}"}
+            years = sorted({dt[:4] for dt in dates})
+            packs = {year: {"dates": [dt for dt in dates if dt.startswith(year)], "factors": {}} for year in years}
+            for year in years:
+                ids = [i for i, dt in enumerate(dates) if dt.startswith(year)]
+                name = f"prices/{spec.code}/{year}"
+                write(name, {"prices": [{"date": bars[i].trade_date, **{k: getattr(bars[i], k) for k in
+                    ("open", "high", "low", "close", "volume", "amount", "history_type")}} for i in ids],
+                    "returns": {h: [items[i] for i in ids] for h, items in returns.items()}})
+                index_payload["price_chunks"].append(name)
+            all_components = {}
             for fid, definition in definitions.items():
                 report_progress("export", f"{spec.short_name}：导出{definition['name']}分析", len(manifest["objects"]), total_objects, "份结果")
                 if any(str(h) not in evaluations.get(fid, {}) for h in factor_horizons(fid)):
@@ -177,8 +189,8 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
                 if [v.trade_date for v in values] != dates:
                     raise ValueError(f"{spec.code} {fid} 未覆盖全部交易日")
                 rolling = {str(h): [] for h in factor_horizons(fid)}
-                for r in session.scalars(select(RollingEvaluation).where(RollingEvaluation.snapshot_id == snap.id,
-                        RollingEvaluation.factor_id == fid).order_by(RollingEvaluation.as_of)):
+                from .research_store import rolling_history
+                for r in rolling_history(session, snap, fid):
                     rolling[str(r.horizon)].append({"date": r.as_of, "ic": r.ic, "samples": r.sample_count})
                 components = []
                 if fid == SPREAD_FACTOR:
@@ -193,10 +205,21 @@ def export_results(directory=None, session_factory=SessionLocal, specs=INDICES):
                         "bond_yield": bond.value if bond else None,
                         "valuation_source": public_source(pe.provenance) if pe else None,
                         "bond_source": public_source(bond.provenance) if bond else None} for row, pe, bond in rows]
-                write(f"factor/{snap.id}/{fid}", {"snapshot_id": snap.id,
-                    "values": [[v.value, v.status] for v in values], "rolling": rolling, "components": components,
-                    "analysis": web_analysis(dates, [b.close for b in bars], [v.value for v in values],
-                        definition, evaluations[fid], spec.launch_date)})
+                # No snapshot IDs, timestamps or changing provenance in historical chunks.
+                # A release binds these immutable series to its current analysis and audit inputs.
+                for year in years:
+                    packs[year]["factors"][fid] = {"values": [[v.value, v.status] for v in values if v.trade_date.startswith(year)],
+                        "rolling": {h: [r for r in rows if r["date"].startswith(year)] for h, rows in rolling.items()}}
+                if components:
+                    all_components[fid] = components
+                index_payload["analyses"][fid] = web_analysis(dates, [b.close for b in bars], [v.value for v in values],
+                    definition, evaluations[fid], spec.launch_date)
+            for year, payload in packs.items():
+                name = f"research/{spec.code}/{year}"
+                write(name, payload)
+                index_payload["research_chunks"].append(name)
+            write(f"inputs/{spec.code}", all_components)
+            write(f"index/{spec.code}", index_payload)
             manifest["indices"].append({"code": spec.code, "name": spec.name, "short_name": spec.short_name,
                 "description": spec.description, "ready": True, "coverage": coverage, "snapshot_id": snap.id})
         report_progress("export", "全历史与逐因子分析导出完成", len(manifest["objects"]), total_objects, "份结果")

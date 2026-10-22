@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 from scipy.stats import spearmanr
 
-from backend.app.evaluation import build_assessment, evaluate_factor, forward_returns, rank_ic, rolling_rank_ic, walk_forward
+from backend.app.evaluation import bootstrap_ci, build_assessment, evaluate_factor, forward_returns, rank_ic, rolling_rank_ic, walk_forward
 from backend.app.factors import REGISTRY, calculate_all, rsi
 
 
@@ -19,7 +19,7 @@ def frame():
 
 def test_all_factors_are_prefix_invariant_and_cover_every_date(frame):
     full, prefix = calculate_all(frame), calculate_all(frame.iloc[:830])
-    assert len(REGISTRY) == 20
+    assert len(REGISTRY) == 28
     for key in REGISTRY:
         assert len(full[key][0]) == len(frame)
         pd.testing.assert_series_equal(full[key][0].iloc[:830], prefix[key][0])
@@ -63,6 +63,37 @@ def test_rolling_ic_is_exact_and_dates_are_label_maturity(frame):
     assert rows[-1]["as_of"] == frame.date.iloc[-1]
     assert rows[0]["ic"] == pytest.approx(rank_ic(x[:252], y[:252]))
     assert rows[-1]["ic"] == pytest.approx(rank_ic(x[-272:-20], y[-272:-20]))
+
+
+@pytest.mark.parametrize("h", [1, 20, 252])
+def test_incremental_maturity_windows_equal_complete_recomputation(frame, h):
+    values = frame.close.pct_change(5)
+    values.iloc[100:120] = np.nan
+    prior = frame.iloc[:-7]
+    _, cached = evaluate_factor(prior, values.iloc[:-7], h, prior.date.iloc[0], "test")
+    incremental, rolling = evaluate_factor(frame, values, h, prior.date.iloc[0], "test", previous_rolling=cached)
+    complete, expected = evaluate_factor(frame, values, h, prior.date.iloc[0], "test")
+    assert incremental == complete
+    assert len(rolling) == len(expected)
+    for a, b in zip(rolling, expected):
+        assert a["as_of"] == b["as_of"] and a["sample_count"] == b["sample_count"]
+        assert a["ic"] == pytest.approx(b["ic"], abs=1e-14) if a["ic"] is not None else b["ic"] is None
+
+
+def test_batched_bootstrap_preserves_scalar_draws_and_interval():
+    rng = np.random.default_rng(71)
+    x, y = rng.integers(0, 20, 1200).astype(float), rng.normal(size=1200)
+    x[10:20] = np.nan
+    actual = bootstrap_ci(x, y, 20, seed=91)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    block, rng = actual["block_length"], np.random.default_rng(91)
+    estimates = []
+    for _ in range(199):
+        starts = rng.integers(0, len(x) - block + 1, size=int(np.ceil(len(x) / block)))
+        ids = (starts[:, None] + np.arange(block)).ravel()[:len(x)]
+        estimates.append(rank_ic(x[ids], y[ids]))
+    assert [actual["lower"], actual["upper"]] == pytest.approx(np.quantile(estimates, [.025, .975]), abs=1e-14)
 
 
 def test_walk_forward_purges_boundary_and_uses_training_thresholds(frame):

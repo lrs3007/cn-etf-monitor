@@ -15,7 +15,7 @@ from .job_control import UpdateCancelled, control_job
 
 def main():
     parser = argparse.ArgumentParser(description="宽基指数：全历史采集、因子计算、IC研究")
-    parser.add_argument("command", choices=["init", "backfill", "update", "recompute", "coverage", "assess", "diagnostics", "export", "publish"])
+    parser.add_argument("command", choices=["init", "backfill", "update", "recompute", "coverage", "assess", "diagnostics", "export", "publish", "collect-etf"])
     parser.add_argument("--index", choices=list(INDEX_MAP), action="append")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-update", action="store_true", help="publish 使用当前快照，不重新采集计算")
@@ -49,7 +49,8 @@ def main():
             with control_job(run_id, sessions=SessionLocal, directory=DATA_DIR, install_signals=True):
                 with SessionLocal.begin() as session:
                     job = session.get(JobRun, run_id)
-                    job.details = {**job.details, "trigger": "cli", "indices": [s.code for s in specs]}
+                    job.details = {**job.details, "trigger": "cli", "indices": [s.code for s in specs],
+                        "mode": "publish_only" if args.command == "publish" and args.skip_update else "update"}
                 result = run_command(args, specs, run_id)
         except UpdateCancelled:
             sys.exit(130)
@@ -60,6 +61,17 @@ def main():
 
 def run_command(args, specs, run_id):
     from .publication import export_results, publish_current_results
+    if args.command == "collect-etf":
+        from .etf_sources import prepare_etf_context
+        context = prepare_etf_context(specs, force=args.force)
+        rows = [{"index": spec.code, "rows": len(context["funds"][spec.code]["prices"]),
+            "status": "inputs_collected"} for spec in specs]
+        with SessionLocal.begin() as session:
+            job = session.get(JobRun, run_id)
+            job.status, job.finished_at = "completed", now_iso()
+            job.details = {**job.details, "results": rows, "input_warnings": context["errors"],
+                "progress": {"stage": "local_complete", "label": "ETF原始历史回填完成，等待因子计算", "updated_at": now_iso()}}
+        return {"errors": [], "shares_rows": len(context["shares"]), "warnings": context["errors"]}
     publish = args.command == "publish" or (args.command == "update" and os.getenv("CN_MONITOR_PUBLISH") == "1")
     if args.command == "export" or (args.command == "publish" and args.skip_update):
         result = {"errors": []}

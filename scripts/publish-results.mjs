@@ -1,5 +1,5 @@
 import { getStore } from "@netlify/blobs";
-import { readFile, mkdir, writeFile, access } from "node:fs/promises";
+import { readFile, mkdir, writeFile, access, rename } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,44 +12,60 @@ import { setTimeout } from "node:timers/promises";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 // All immutable objects must be durable before the single public pointer changes.
-export async function publishResults(store, manifest, readObject, progress = () => {}, checkCancelled = async () => {}) {
+export async function publishResults(store, manifest, readObject, progress = () => {}, checkCancelled = async () => {}, concurrency = 6, verified = new Set(), onVerified = async () => {}) {
   await checkCancelled();
-  if (manifest.schema_version !== 1 || !/^[a-f0-9]{64}$/.test(manifest.export_id)) throw new Error("Invalid export manifest");
+  if (![1, 2].includes(manifest.schema_version) || !/^[a-f0-9]{64}$/.test(manifest.export_id)) throw new Error("Invalid export manifest");
   const previous = await store.getWithMetadata("manifest", { type: "json", consistency: "strong" });
   if (previous?.data?.export_id === manifest.export_id) {
     const items = [...new Map(Object.values(manifest.objects).map(item => [item.key, item])).values()];
     const bytes = items.reduce((sum, item) => sum + item.bytes, 0);
-    progress(items.length, items.length, { phase: "finalize", completed_bytes: bytes, total_bytes: bytes });
-    return { changed: false, uploaded: 0, published_at: previous.data.published_at };
+    progress(items.length, items.length, { phase: "finalize", completed_bytes: bytes, total_bytes: bytes,
+      uploaded: 0, reused: items.length, uploaded_bytes: 0 });
+    return { changed: false, uploaded: 0, reused: items.length, uploaded_bytes: 0, published_at: previous.data.published_at };
   }
   const unique = new Map();
   for (const item of Object.values(manifest.objects)) {
     if (!/^objects\/[a-f0-9]{64}\.json\.gz$/.test(item.key) || item.key !== `objects/${item.sha256}.json.gz`) throw new Error("Invalid object key");
     unique.set(item.key, item);
   }
-  let uploaded = 0, completed = 0, completedBytes = 0;
+  // Published objects are immutable and were strongly verified before that release.
+  const durable = new Set(Object.values(previous?.data?.objects || {}).map(item => item.key));
+  for (const key of verified) durable.add(key);
+  let uploaded = 0, reused = 0, completed = 0, completedBytes = 0, uploadedBytes = 0;
   const items = [...unique.values()];
   const totalBytes = items.reduce((sum, item) => sum + item.bytes, 0);
-  const notify = phase => progress(completed, items.length, { phase, completed_bytes: completedBytes, total_bytes: totalBytes });
+  const notify = phase => progress(completed, items.length, { phase, completed_bytes: completedBytes, total_bytes: totalBytes, uploaded, reused, uploaded_bytes: uploadedBytes });
   notify("upload");
   async function upload(item) {
     await checkCancelled();
     const data = await readObject(item.key);
     if (data.byteLength !== item.bytes || createHash("sha256").update(data).digest("hex") !== item.sha256) throw new Error("Export checksum mismatch");
-    if (await store.getMetadata(item.key, { consistency: "strong" })) return;
+    if (durable.has(item.key)) { reused++; return; }
     const result = await store.set(item.key, new Uint8Array(data).buffer, { onlyIfNew: true });
-    if (!await store.getMetadata(item.key, { consistency: "strong" })) throw new Error("Uploaded object is not durable");
-    if (result.modified) uploaded++;
+    let durableObject = await store.getMetadata(item.key, { consistency: "strong" });
+    for (let attempt = 0; !durableObject && attempt < 2; attempt++) {
+      await checkCancelled();
+      await setTimeout(500 * 2 ** attempt);
+      durableObject = await store.getMetadata(item.key, { consistency: "strong" });
+    }
+    if (!durableObject) throw Object.assign(new Error("Uploaded object is not durable"), { code: "OBJECT_NOT_DURABLE" });
+    verified.add(item.key);
+    await onVerified();
+    if (result.modified) { uploaded++; uploadedBytes += item.bytes; } else reused++;
   }
-  for (let offset = 0; offset < items.length; offset += 4) {
-    await checkCancelled();
-    const results = await Promise.allSettled(items.slice(offset, offset + 4).map(async item => {
-      await upload(item);
-      completed++; completedBytes += item.bytes; notify("upload");
-    }));
-    const failed = results.find(r => r.status === "rejected");
-    if (failed) throw failed.reason;
-  }
+  let cursor = 0, failure;
+  // Workers immediately take the next object; a slow request cannot stall a batch.
+  const workers = Array.from({ length: Math.min(items.length, Math.max(1, Math.min(12, Math.trunc(concurrency) || 6))) }, async () => {
+    while (!failure && cursor < items.length) {
+      const item = items[cursor++];
+      try {
+        await upload(item);
+        completed++; completedBytes += item.bytes; notify("upload");
+      } catch (error) { failure ||= error; }
+    }
+  });
+  await Promise.all(workers); // Drain in-flight writes before reporting failure/cancellation.
+  if (failure) throw failure;
   await checkCancelled();
   const published = { ...manifest, published_at: new Date().toISOString() };
   // Keep old immutable objects so already-open browsers retain consistent snapshots.
@@ -64,7 +80,7 @@ export async function publishResults(store, manifest, readObject, progress = () 
   }
   const confirmed = await store.get("manifest", { type: "json", consistency: "strong" });
   if (confirmed?.export_id !== manifest.export_id) throw new Error("Release verification failed");
-  return { changed: true, uploaded, published_at: published.published_at };
+  return { changed: true, uploaded, reused, uploaded_bytes: uploadedBytes, published_at: published.published_at };
 }
 
 async function credentials() {
@@ -93,7 +109,21 @@ async function main() {
   const agent = proxy ? new HttpsProxyAgent(proxy) : undefined;
   let result;
   try {
-    const store = getStore({ name: "research-results", ...(await credentials()), consistency: "strong",
+    const auth = await credentials();
+    const journalFile = resolve(root, "data/run", `verified-objects-${auth.siteID}.json`);
+    let journal = [];
+    try { journal = JSON.parse(await readFile(journalFile, "utf8")); } catch {}
+    const verified = new Set(Array.isArray(journal) ? journal.filter(key => typeof key === "string" && /^objects\/[a-f0-9]{64}\.json\.gz$/.test(key)) : []);
+    let journalWrite = Promise.resolve();
+    const saveJournal = () => {
+      journalWrite = journalWrite.then(async () => {
+        await mkdir(dirname(journalFile), { recursive: true });
+        await writeFile(journalFile + ".tmp", JSON.stringify([...verified]));
+        await rename(journalFile + ".tmp", journalFile);
+      });
+      return journalWrite;
+    };
+    const store = getStore({ name: "research-results", ...auth, consistency: "strong",
       fetch: async (url, options) => {
         for (let attempt = 0; ; attempt++) {
           try {
@@ -125,7 +155,7 @@ async function main() {
     result = await publishResults(store, manifest, key => readFile(resolve(directory, key)), (done, total, extra) => {
       if (structuredProgress) console.log("CN_MONITOR_PROGRESS " + JSON.stringify({ completed: done, total, ...extra }));
       if (done % 20 === 0 || done === total) console.error(`结果对象：${done}/${total}`);
-    }, checkCancelled);
+    }, checkCancelled, 6, verified, saveJournal);
   } finally { agent?.destroy(); }
   await mkdir(resolve(root, "data/run"), { recursive: true });
   await writeFile(resolve(root, "data/run/last-publication.json"), JSON.stringify({ ...result, export_id: manifest.export_id, checked_at: new Date().toISOString() }));

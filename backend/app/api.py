@@ -97,8 +97,8 @@ def factor_detail(code: str, factor_id: str, horizon: int = 20, snapshot_id: str
             Evaluation.snapshot_id == snapshot.id, Evaluation.factor_id == factor_id))}
         returns = {r.trade_date: r.value for r in session.scalars(select(ForwardReturn).where(
             ForwardReturn.snapshot_id == snapshot.id, ForwardReturn.horizon == horizon)).all()}
-        rolling = session.scalars(select(RollingEvaluation).where(RollingEvaluation.snapshot_id == snapshot.id,
-            RollingEvaluation.factor_id == factor_id, RollingEvaluation.horizon == horizon).order_by(RollingEvaluation.as_of)).all()
+        from .research_store import rolling_history
+        rolling = rolling_history(session, snapshot, factor_id, horizon)
         components = []
         if factor_id == SPREAD_FACTOR:
             inputs = session.execute(select(FactorInput, ValuationObservation, MacroObservation)
@@ -175,9 +175,11 @@ def latest_update():
 
 
 @app.post("/api/v1/updates", status_code=202, dependencies=[Depends(require_update_access)])
-def create_update():
+def create_update(mode: str = "update"):
+    if mode not in ("update", "publish_only"):
+        raise HTTPException(422, "未知更新模式")
     try:
-        return start_update()
+        return start_update(mode=mode) if mode != "update" else start_update()
     except UpdateBusy as exc:
         raise HTTPException(409, str(exc)) from None
 

@@ -1,5 +1,6 @@
 """Full-history providers. Raw responses are retained for audit and offline replay."""
 import hashlib
+import atexit
 import json
 import os
 import re
@@ -13,31 +14,45 @@ import numpy as np
 import pandas as pd
 
 from .config import DATA_DIR, ROOT, SHANGHAI, IndexSpec, now_iso
+from .provider_cache import cached_history
+from .job_control import check_cancelled
+from urllib.parse import urlsplit
+
+_host_failures = {}
+_http_client = httpx.Client(timeout=httpx.Timeout(15, connect=5), follow_redirects=True,
+    limits=httpx.Limits(max_connections=8, max_keepalive_connections=8, keepalive_expiry=60))
+atexit.register(_http_client.close)
 
 
 class ProviderError(RuntimeError):
     pass
 
 
-def fetch(url, params=None, *, method="GET", body=None):
+def fetch(url, params=None, *, method="GET", body=None, headers=None):
     """Bounded retries; do not disable proxies or TLS verification."""
     error = None
-    for attempt in range(3):
+    host = urlsplit(url).netloc
+    if time.monotonic() - _host_failures.get(host, -1e9) < 600:
+        raise ProviderError("同一数据源近期连接失败，短暂冷却，稍后重试")
+    for attempt in range(2):
+        check_cancelled()
         try:
-            with httpx.Client(timeout=30, follow_redirects=True) as client:
-                response = client.request(method, url, params=params, json=body,
-                    headers={"User-Agent": "Mozilla/5.0 cn-etf-monitor/0.1"})
-                response.raise_for_status()
-                if not response.content:
-                    raise ProviderError("数据源返回空响应")
-                return response.text
+            response = _http_client.request(method, url, params=params, json=body,
+                headers={"User-Agent": "Mozilla/5.0 cn-etf-monitor/0.1", **(headers or {})})
+            response.raise_for_status()
+            if not response.content:
+                raise ProviderError("数据源返回空响应")
+            return response.text
         except (httpx.HTTPError, ProviderError) as exc:
             error = exc
-            if attempt < 2:
+            if attempt < 1:
                 time.sleep(1 + attempt)
     # Some public market hosts close httpx connections; curl offers a second HTTP transport.
     # Proxy and TLS policy are preserved. Credentials, when present, go over stdin only.
-    command = ["curl", "--max-time", "20", "--fail", "--silent", "--show-error", "--location"]
+    check_cancelled()
+    command = ["curl", "--max-time", "12", "--fail", "--silent", "--show-error", "--location"]
+    for key, value in (headers or {}).items():
+        command.extend(["--header", f"{key}: {value}"])
     if params:
         command.append("--get")
         for key, value in params.items():
@@ -50,6 +65,7 @@ def fetch(url, params=None, *, method="GET", body=None):
             text=True, capture_output=True, timeout=25, check=True)
         return response.stdout
     except (OSError, subprocess.SubprocessError) as exc:
+        _host_failures[host] = time.monotonic()
         raise ProviderError(f"HTTP请求失败：{error}; curl传输亦失败") from exc
 
 
@@ -86,7 +102,8 @@ def sina_history(spec: IndexSpec, offline=False):
     return frame, record
 
 
-def eastmoney_history(spec: IndexSpec, offline=False):
+@cached_history("eastmoney")
+def eastmoney_history(spec: IndexSpec, offline=False, start_date=None):
     if offline:
         files = sorted((DATA_DIR / "raw" / spec.code).glob("eastmoney-*.txt"), key=lambda p: p.stat().st_mtime)
         if not files:
@@ -96,9 +113,10 @@ def eastmoney_history(spec: IndexSpec, offline=False):
         text = fetch("https://push2his.eastmoney.com/api/qt/stock/kline/get", {
             "secid": spec.secid, "fields1": "f1,f2,f3,f4,f5",
             "fields2": "f51,f52,f53,f54,f55,f56,f57", "klt": "101", "fqt": "0",
-            "beg": "19900101", "end": "20500101", "lmt": "100000",
+            "beg": start_date.replace("-", "") if start_date else "19900101", "end": "20500101", "lmt": "100000",
         })
-    record = archive(spec.code, "eastmoney", text)
+    record = archive(spec.code, "tail_eastmoney" if start_date else "eastmoney", text)
+    record["source"] = "eastmoney"
     data = json.loads(text).get("data")
     if not data or not data.get("klines"):
         raise ProviderError("东方财富没有返回该指数历史")
@@ -141,7 +159,11 @@ def load_valuations(spec, offline=False):
         # Request yearly chunks to avoid silently hitting a provider row limit.
         for year in range(int(spec.base_date[:4]), date.today().year + 1):
             try:
-                text = fetch("https://api.tushare.pro", method="POST", body={
+                cached = sorted((DATA_DIR / "raw" / spec.code).glob(f"tushare_{year}-*.txt"), key=lambda p: p.stat().st_mtime)
+                from .provider_cache import _force
+                checked = DATA_DIR / "provider-cache" / f"{spec.code}-tushare-{year}.checked"
+                reusable = cached and year < date.today().year and not _force.get() and checked.exists() and time.time() - checked.stat().st_mtime < 7 * 86400
+                text = cached[-1].read_text() if reusable else fetch("https://api.tushare.pro", method="POST", body={
                     "api_name": "index_dailybasic", "token": token,
                     "params": {"ts_code": spec.code, "start_date": f"{year}0101", "end_date": f"{year}1231"},
                     "fields": "ts_code,trade_date,pe_ttm,pb",
@@ -149,6 +171,10 @@ def load_valuations(spec, offline=False):
                 payload = json.loads(text)
                 if payload.get("code") != 0:
                     raise ProviderError(payload.get("msg", "Tushare请求失败"))
+                if not reusable:
+                    archive(spec.code, f"tushare_{year}", text)
+                    checked.parent.mkdir(parents=True, exist_ok=True)
+                    checked.write_text(now_iso())
                 data = payload.get("data") or {}
                 for row in data.get("items", []):
                     item = dict(zip(data["fields"], row))
@@ -166,7 +192,8 @@ def load_valuations(spec, offline=False):
     return records, notes
 
 
-def cnindex_history(spec, offline=False):
+@cached_history("cnindex")
+def cnindex_history(spec, offline=False, start_date=None):
     """Official ChiNext 50 backcast, including the real close-only base observation."""
     if offline:
         files = sorted((DATA_DIR / "raw" / spec.code).glob("cnindex-*.txt"), key=lambda p: p.stat().st_mtime)
@@ -175,9 +202,10 @@ def cnindex_history(spec, offline=False):
         text = files[-1].read_text()
     else:
         text = fetch("https://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat", {
-            "indexCode": spec.code[:6], "startDate": spec.base_date,
+            "indexCode": spec.code[:6], "startDate": start_date or spec.base_date,
             "endDate": date.today().isoformat(), "frequency": "day"})
-    record = archive(spec.code, "cnindex", text)
+    record = archive(spec.code, "tail_cnindex" if start_date else "cnindex", text)
+    record["source"] = "cnindex"
     data = json.loads(text).get("data") or {}
     rows = data.get("data") or []
     if not rows:
@@ -192,7 +220,8 @@ def cnindex_history(spec, offline=False):
     return frame[["date", "open", "high", "low", "close", "amount", "volume", "source"]], record
 
 
-def csindex_history(spec, offline=False):
+@cached_history("csindex")
+def csindex_history(spec, offline=False, start_date=None):
     """CSI official observations. Caller must align to independently obtained sessions."""
     if offline:
         files = sorted((DATA_DIR / "raw" / spec.code).glob("csindex-*.txt"), key=lambda p: p.stat().st_mtime)
@@ -201,8 +230,9 @@ def csindex_history(spec, offline=False):
         text = files[-1].read_text()
     else:
         text = fetch("https://www.csindex.com.cn/csindex-home/perf/index-perf", {
-            "indexCode": spec.code[:6], "startDate": "19900101", "endDate": date.today().strftime("%Y%m%d")})
-    record = archive(spec.code, "csindex", text)
+            "indexCode": spec.code[:6], "startDate": start_date.replace("-", "") if start_date else "19900101", "endDate": date.today().strftime("%Y%m%d")})
+    record = archive(spec.code, "tail_csindex" if start_date else "csindex", text)
+    record["source"] = "csindex"
     payload = json.loads(text)
     rows = payload.get("data") or []
     if not rows:
@@ -218,37 +248,37 @@ def csindex_history(spec, offline=False):
 
 
 def full_history(spec, offline=False, bond_context=None):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
     frames, records, errors = {}, [], []
-    for name, provider in (("sina", sina_history), ("eastmoney", eastmoney_history)):
+    providers = [("sina", sina_history), ("eastmoney", eastmoney_history),
+        ("cnindex", cnindex_history) if spec.code == "399673.SZ" else ("csindex", csindex_history)]
+
+    def collect(name, provider):
         try:
-            frame, record = provider(spec, offline=offline)
-            frames[name] = frame.set_index("date")
-            records.append(record)
+            source_frame, record = provider(spec, offline=offline)
+            return source_frame, record, None
         except (ProviderError, ValueError, subprocess.SubprocessError) as exc:
-            errors.append(f"{name}: {exc}")
+            error = f"{name}: {exc}"
             if not offline:
                 try:
                     cached, record = provider(spec, offline=True)
-                    record["replayed_cache"] = True
-                    frames[name] = cached.set_index("date")
-                    records.append(record)
+                    return cached, {**record, "replayed_cache": True}, error
                 except (ProviderError, ValueError, subprocess.SubprocessError):
                     pass
-    if spec.code == "399673.SZ":
-        try:
-            official, record = cnindex_history(spec, offline=offline)
-            frames["cnindex"] = official.set_index("date")
+            return None, None, error
+
+    # Independent sources overlap network waits; SQLite publication remains serial.
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="market-source") as executor:
+        pending = [(name, executor.submit(copy_context().run, collect, name, provider)) for name, provider in providers]
+        collected = {name: future.result() for name, future in pending}
+    for name, (source_frame, record, error) in collected.items():
+        if error:
+            errors.append(error)
+        if record:
             records.append(record)
-        except (ProviderError, ValueError) as exc:
-            errors.append(f"cnindex: {exc}")
-            if not offline:
-                try:
-                    cached, record = cnindex_history(spec, offline=True)
-                    record["replayed_cache"] = True
-                    frames["cnindex"] = cached.set_index("date")
-                    records.append(record)
-                except (ProviderError, ValueError):
-                    pass
+        if source_frame is not None and name != "csindex":
+            frames[name] = source_frame.set_index("date")
     if not frames:
         raise ProviderError("; ".join(errors))
     # Sina retains the longest backcast and three-decimal prices. Supplement amount from Eastmoney.
@@ -275,19 +305,7 @@ def full_history(spec, offline=False, bond_context=None):
         frame = frame.combine_first(official)
         frame.loc[frame.index.isin(overlap), "source"] = frame.loc[frame.index.isin(overlap), "source"] + "+cnindex"
     if spec.code != "399673.SZ":
-        official = None
-        try:
-            official, record = csindex_history(spec, offline=offline)
-            records.append(record)
-        except (ProviderError, ValueError) as exc:
-            errors.append(f"csindex: {exc}")
-            if not offline:
-                try:
-                    official, record = csindex_history(spec, offline=True)
-                    record["replayed_cache"] = True
-                    records.append(record)
-                except (ProviderError, ValueError):
-                    pass
+        official = collected["csindex"][0]
         if official is not None:
             official = official.set_index("date")
             # CSI sometimes repeats a nearby observation at a non-trading request boundary.
@@ -331,7 +349,8 @@ def full_history(spec, offline=False, bond_context=None):
         for _, row in valid_pe.iterrows():
             valuations.insert(0, {"date": row["date"],
                 "available_date": (date.fromisoformat(str(row["date"])) + timedelta(days=1)).isoformat(),
-                "pe_ttm": row["pe_observed"], "pb": np.nan, "source": "csindex"})
+                "pe_ttm": row["pe_observed"], "pb": np.nan, "source": "csindex",
+                "raw_record": frame.loc[frame.date == row["date"], "pe_record"].iloc[0] if "pe_record" in frame else None})
         if len(valid_pe):
             valuation_notes.append("中证官方滚动市盈率仅覆盖实际提供区间；采用次日可用假设，非严格点时数据，不补齐早期缺失")
     if valuations:

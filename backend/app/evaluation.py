@@ -38,12 +38,16 @@ def bootstrap_ci(x, y, horizon, seed=42, repetitions=199):
         return None
     rng = np.random.default_rng(seed)
     estimates = []
-    for _ in range(repetitions):
-        starts = rng.integers(0, n - block + 1, size=int(np.ceil(n / block)))
-        ids = (starts[:, None] + np.arange(block)).ravel()[:n]
-        value = rank_ic(x[ids], y[ids])
-        if value is not None:
-            estimates.append(value)
+    # Same random draws/block definition as the scalar implementation, batched ranks.
+    for offset in range(0, repetitions, 16):
+        starts = rng.integers(0, n - block + 1, size=(min(16, repetitions - offset), int(np.ceil(n / block))))
+        ids = (starts[:, :, None] + np.arange(block)).reshape(len(starts), -1)[:, :n]
+        a, b = rankdata(x[ids], axis=1), rankdata(y[ids], axis=1)
+        a -= a.mean(axis=1, keepdims=True)
+        b -= b.mean(axis=1, keepdims=True)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            correlations = (a * b).sum(axis=1) / np.sqrt((a * a).sum(axis=1) * (b * b).sum(axis=1))
+        estimates.extend(correlations[np.isfinite(correlations)].tolist())
     if len(estimates) < repetitions * 0.9:
         return None
     lo, hi = np.quantile(estimates, [0.025, 0.975])
@@ -52,7 +56,7 @@ def bootstrap_ci(x, y, horizon, seed=42, repetitions=199):
         "note": "单项区间，未作多因子/多期限校正；用于不确定性展示"}
 
 
-def rolling_rank_ic(x, y, dates, horizon, window=252, min_samples=200):
+def rolling_rank_ic(x, y, dates, horizon, window=252, min_samples=200, start_after=None):
     """Window ends at signal t; the result is available only when label t+h matures."""
     x, y = np.asarray(x, float), np.asarray(y, float)
     if len(x) < window + horizon:
@@ -60,7 +64,8 @@ def rolling_rank_ic(x, y, dates, horizon, window=252, min_samples=200):
     points = []
     xs = np.lib.stride_tricks.sliding_window_view(x, window)
     ys = np.lib.stride_tricks.sliding_window_view(y, window)
-    for offset in range(0, len(xs) - horizon, 256):
+    start = max(0, int(np.searchsorted(np.asarray(dates), start_after, side="right")) - (window - 1 + horizon)) if start_after else 0
+    for offset in range(start, len(xs) - horizon, 256):
         a = xs[offset:min(offset + 256, len(xs) - horizon)].copy()
         b = ys[offset:min(offset + 256, len(xs) - horizon)].copy()
         mask = np.isfinite(a) & np.isfinite(b)
@@ -79,7 +84,7 @@ def rolling_rank_ic(x, y, dates, horizon, window=252, min_samples=200):
     return points
 
 
-def walk_forward(x, y, dates, horizon, min_train=504):
+def walk_forward(x, y, dates, horizon, min_train=504, memo=None):
     """Annual expanding training; remove labels crossing each test boundary."""
     x, y, dates = np.asarray(x, float), np.asarray(y, float), np.asarray(dates)
     years = np.array([str(d)[:4] for d in dates])
@@ -90,21 +95,28 @@ def walk_forward(x, y, dates, horizon, min_train=504):
         train = np.where((np.arange(len(x)) + horizon < year_start) & np.isfinite(x) & np.isfinite(y))[0]
         if len(train) < min_train or len(test) < 30:
             continue
-        train_ic, test_ic = rank_ic(x[train], y[train]), rank_ic(x[test], y[test])
-        if train_ic is None:
+        def calculate():
+            train_ic, test_ic = rank_ic(x[train], y[train]), rank_ic(x[test], y[test])
+            if train_ic is None:
+                return None
+            thresholds = np.quantile(x[train], [0.2, 0.4, 0.6, 0.8])
+            buckets = np.searchsorted(thresholds, x[test], side="right")
+            return {"year": str(year), "train_ic": train_ic, "test_ic": test_ic,
+                "train_samples": len(train), "test_samples": len(test),
+                "train_end": str(dates[train[-1]]), "test_start": str(dates[test[0]]),
+                "direction": 1 if train_ic >= 0 else -1,
+                "buckets": buckets.tolist(), "test_indices": test.tolist()}
+        closed = int(np.where(years == year)[0][-1]) + horizon < len(x)
+        fold = memo.compute(f"walk_forward/{horizon}/{min_train}/{year}",
+            [train, test, x[train], y[train], x[test], y[test], dates[train].astype("U10"), dates[test].astype("U10")], calculate) if memo and closed else calculate()
+        if fold is None:
             continue
-        thresholds = np.quantile(x[train], [0.2, 0.4, 0.6, 0.8])
-        buckets = np.searchsorted(thresholds, x[test], side="right")
-        folds.append({"year": str(year), "train_ic": train_ic, "test_ic": test_ic,
-            "train_samples": len(train), "test_samples": len(test),
-            "train_end": str(dates[train[-1]]), "test_start": str(dates[test[0]]),
-            "direction": 1 if train_ic >= 0 else -1,
-            "buckets": buckets.tolist(), "test_indices": test.tolist()})
+        folds.append(fold)
         oos_indices.extend(test.tolist())
     return folds, np.array(oos_indices, dtype=int)
 
 
-def evaluate_factor(frame, values, horizon, launch_date, factor_id):
+def evaluate_factor(frame, values, horizon, launch_date, factor_id, previous_rolling=None, memo=None):
     # All factors retain backcast history; research defaults to published-index history.
     keep = np.asarray(frame.date >= launch_date)
     dates = frame.date.to_numpy()[keep]
@@ -112,14 +124,18 @@ def evaluate_factor(frame, values, horizon, launch_date, factor_id):
     y = forward_returns(frame.close, horizon).to_numpy()[keep]
     valid = np.isfinite(x) & np.isfinite(y)
     full_ic = rank_ic(x, y)
-    folds, oos = walk_forward(x, y, dates, horizon)
+    folds, oos = walk_forward(x, y, dates, horizon, memo=memo)
     seed = int(hashlib.sha256(factor_id.encode()).hexdigest()[:8], 16) + horizon
     oos_ic = rank_ic(x[oos], y[oos]) if len(oos) else None
     ci = bootstrap_ci(x[oos], y[oos], horizon, seed=seed) if len(oos) else None
-    yearly = [{"year": str(year), "ic": rank_ic(x[np.array([str(d).startswith(str(year)) for d in dates])],
-        y[np.array([str(d).startswith(str(year)) for d in dates])]),
-        "samples": int(np.sum(valid & np.array([str(d).startswith(str(year)) for d in dates])))}
-        for year in sorted({str(d)[:4] for d in dates})]
+    years = np.array([str(d)[:4] for d in dates])
+    yearly = []
+    for year in np.unique(years):
+        ids = np.where(years == year)[0]
+        def statistic():
+            return {"year": str(year), "ic": rank_ic(x[ids], y[ids]), "samples": int(valid[ids].sum())}
+        closed = ids[-1] + horizon < len(x)
+        yearly.append(memo.compute(f"yearly/{horizon}/{year}", [x[ids], y[ids]], statistic) if memo and closed else statistic())
     grouped = [[] for _ in range(5)]
     for fold in folds:
         for bucket, idx in zip(fold["buckets"], fold["test_indices"]):
@@ -146,7 +162,8 @@ def evaluate_factor(frame, values, horizon, launch_date, factor_id):
         "multiple_testing": "未进行显著性筛选；全部预设因子与期限均展示，置信区间未校正多重检验",
         "walk_forward": "年度扩展训练，至少504个有效训练样本，边界剔除跨期标签；分组阈值仅由训练集确定",
     }
-    rolling = rolling_rank_ic(x, y, dates, horizon) if valid.any() else []
+    cached = previous_rolling or []
+    rolling = cached + rolling_rank_ic(x, y, dates, horizon, start_after=cached[-1]["as_of"] if cached else None) if valid.any() else []
     result["recent_ic"] = next((point["ic"] for point in reversed(rolling) if point["ic"] is not None), None)
     return result, rolling
 
@@ -176,7 +193,7 @@ def build_assessment(frame, results, evaluations, metadata, horizon):
         evidence.append({"factor_id": key, "name": metadata[key]["name"], "category": metadata[key]["category"],
             "current": current, "percentile": percentile, "direction_ic": direction_ic, "oos_ic": oos,
             "eligible": bool(eligible), "score": finite(score),
-            "stance": "偏强" if eligible and score > 0.2 else "偏弱" if eligible and score < -0.2 else "中性" if eligible else "估值观察" if not metadata[key].get("assessment_enabled", True) else "证据不足"})
+            "stance": "偏强" if eligible and score > 0.2 else "偏弱" if eligible and score < -0.2 else "中性" if eligible else ("估值观察" if metadata[key]["category"] == "估值" else metadata[key].get("purpose", "研究观察")) if not metadata[key].get("assessment_enabled", True) else "证据不足"})
     categories = {}
     for category in dict.fromkeys(item["category"] for item in evidence):
         eligible = [e["score"] for e in evidence if e["category"] == category and e["eligible"]]

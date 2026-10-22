@@ -3,9 +3,11 @@ export interface UpdateStatus {
   busy: boolean;
   can_stop?: boolean;
   job: { id: string; status: string; started_at: string; finished_at: string | null;
-    details: { active_index?: string; indices?: string[]; trigger?: string; stop_requested_at?: string;
+    details: { active_index?: string; indices?: string[]; trigger?: string; mode?: string; stop_requested_at?: string;
+      timings?: Record<string, number>;
       progress?: { stage: string; stopped_stage?: string; label: string; completed?: Nullable; total?: Nullable; unit?: string | null;
-        updated_at: string; completed_bytes?: Nullable; total_bytes?: Nullable; legacy?: boolean; };
+        updated_at: string; completed_bytes?: Nullable; total_bytes?: Nullable; legacy?: boolean;
+        uploaded?: Nullable; reused?: Nullable; uploaded_bytes?: Nullable; };
       publication?: { status: "publishing" | "published" | "unchanged" | "failed" | "skipped" | "disabled" | "interrupted" | "cancelled";
         export_id?: string; published_at?: string; finished_at?: string; error?: string; };
       results?: { index: string; status: string; last_date?: string; rows: number; warnings?: string[] }[];
@@ -18,7 +20,8 @@ export interface Coverage {
   bond_provider_errors?: string[]; bond_series?: string;
   factor_coverage: Record<string, FactorCoverage>;
 }
-export interface FactorCoverage { total: number; valid: number; warmup: number; missing: number; undefined: number; first_valid: string | null; last_valid: string | null; }
+export interface ResearchSource { instrument_code: string; instrument_name: string; note: string; input_observation_date?: string; latest_observation_date?: string; earliest_available_date?: string; }
+export interface FactorCoverage { source?: ResearchSource; total: number; valid: number; warmup: number; missing: number; undefined: number; first_valid: string | null; last_valid: string | null; }
 export interface IndexInfo { code: string; name: string; short_name: string; description: string; ready: boolean; coverage: Coverage | null; }
 export interface Evaluation {
   horizon: number;
@@ -37,7 +40,7 @@ export interface Evaluation {
     fdr_family_tests?: number;
   };
 }
-export interface Factor { id: string; name: string; category: string; unit: string; formula: string; description: string; version: number; coverage: FactorCoverage; evaluation: Evaluation; horizons?: number[]; assessment_enabled?: boolean; min_percentile_samples?: number; }
+export interface Factor { source_group?: string; purpose?: string; explanation?: string; id: string; name: string; category: string; unit: string; formula: string; description: string; version: number; coverage: FactorCoverage; evaluation: Evaluation; horizons?: number[]; assessment_enabled?: boolean; min_percentile_samples?: number; }
 export interface Evidence { factor_id: string; name: string; category: string; current: Nullable; percentile: Nullable; direction_ic: Nullable; oos_ic: Nullable; eligible: boolean; score: Nullable; stance: string; }
 export interface Price { date: string; close: number; open: Nullable; high: Nullable; low: Nullable; volume: Nullable; amount: Nullable; history_type: string; }
 export interface Dashboard {

@@ -105,13 +105,15 @@ def update_status():
             lock.close()
 
 
-def start_update(trigger="web"):
+def start_update(trigger="web", mode="update"):
+    if mode not in ("update", "publish_only"):
+        raise ValueError("未知更新模式")
     lock = acquire_update_lock()
     run_id = uuid.uuid4().hex
     try:
         with SessionLocal.begin() as session:
             job = JobRun(id=run_id, started_at=job_started_at(), status="queued",
-                details={"indices": [spec.code for spec in INDICES], "trigger": trigger})
+                details={"indices": [spec.code for spec in INDICES], "trigger": trigger, "mode": mode})
             session.add(job)
             result = serialize_job(job)
         logs = DATA_DIR / "logs"
@@ -182,7 +184,10 @@ def stop_update(run_id):
 
 def run_web_update(run_id):
     from .pipeline import run_pipeline
-    result = run_pipeline(run_id=run_id)
+    with SessionLocal() as session:
+        job = session.get(JobRun, run_id)
+        publish_only = bool(job and job.details.get("mode") == "publish_only")
+    result = {"errors": [], "results": []} if publish_only else run_pipeline(run_id=run_id)
     check_cancelled()
     enabled = os.getenv("CN_MONITOR_PUBLISH") == "1"
     with SessionLocal.begin() as session:

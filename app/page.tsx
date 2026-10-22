@@ -13,7 +13,7 @@ const defaults = [
   { code: "399673.SZ", short_name: "创业板50", description: "深圳市场 · 创业板高流动性" },
   { code: "000688.SH", short_name: "科创50", description: "上海市场 · 科技创新" },
 ];
-const standardCategories = ["趋势", "动量", "风险", "量价", "估值"];
+const standardCategories = ["趋势", "动量", "风险", "量价", "估值", "资金申赎", "ETF流动性", "ETF特征", "市场宽度"];
 
 export default function Page() {
   const [code, setCode] = useState("000300.SH");
@@ -27,7 +27,7 @@ export default function Page() {
   const [refresh, setRefresh] = useState(0);
   const [expanded, setExpanded] = useState<Set<string>>(new Set(["momentum_20"]));
   const [modal, setModal] = useState<"coverage" | "method" | null>(null);
-  const [sort, setSort] = useState("default");
+  const [sort, setSort] = useState("ic");
   const [update, setUpdate] = useState<UpdateStatus | null>(null);
   const [startingUpdate, setStartingUpdate] = useState(false);
   const [stoppingUpdate, setStoppingUpdate] = useState(false);
@@ -110,8 +110,17 @@ export default function Page() {
   const factors = useMemo(() => {
     const filtered = (data?.factors || []).filter(f => category === "全部因子" || f.category === category);
     const order = ["momentum_20", "ma_bias_20", "rsi_14", "volatility_20", "amount_ratio_20", "equity_bond_spread_10y", "pe_ttm"];
-    return filtered.sort((a, b) => sort === "ic" ? Math.abs(b.evaluation.oos_ic ?? -0) - Math.abs(a.evaluation.oos_ic ?? -0)
-      : (order.includes(a.id) ? order.indexOf(a.id) : 99) - (order.includes(b.id) ? order.indexOf(b.id) : 99));
+    return filtered.sort((a, b) => {
+      const researchOrder = (order.includes(a.id) ? order.indexOf(a.id) : 99) - (order.includes(b.id) ? order.indexOf(b.id) : 99);
+      if (sort === "default") return researchOrder;
+      const av = sort.startsWith("full_") ? a.evaluation.full_ic : a.evaluation.oos_ic;
+      const bv = sort.startsWith("full_") ? b.evaluation.full_ic : b.evaluation.oos_ic;
+      const aMissing = av == null || !Number.isFinite(av), bMissing = bv == null || !Number.isFinite(bv);
+      if (aMissing || bMissing) return aMissing === bMissing ? researchOrder : aMissing ? 1 : -1;
+      const difference = sort === "ic" ? Math.abs(bv) - Math.abs(av)
+        : sort.endsWith("_asc") ? av - bv : bv - av;
+      return difference || researchOrder;
+    });
   }, [data, category, sort]);
   const activeCount = data?.factors.filter(f => f.coverage.valid > 0).length || 0;
 
@@ -120,11 +129,11 @@ export default function Page() {
     setTimeout(() => document.getElementById(`factor-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
   }
 
-  async function refreshData() {
+  async function refreshData(mode: "update" | "publish_only" = "update") {
     setStartingUpdate(true); setUpdateError("");
     try {
       if (publishedMode) { setPublishedAt(await refreshPublication()); setRefresh(x => x + 1); return; }
-      const response = await fetch("/api/v1/updates", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const response = await fetch(`/api/v1/updates?mode=${mode}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || "无法启动同步");
       setUpdate(body); lastJob.current = `${body.job.id}:${body.job.status}:true`;
@@ -148,8 +157,8 @@ export default function Page() {
   const publication = update?.job?.details.publication;
   const updateMessage = publishedMode ? `本机计算 · 网页展示已发布结果${publishedAt ? ` · 发布于 ${new Date(publishedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}` : ""}。每分钟自动检查新结果；数据日期以各指数显示为准。` : update?.busy && update.job?.status === "publishing" ? "本机采集与计算已完成，正在同步网页结果，请稍候。" : update?.busy ? `正在同步五个指数${update.job?.details.active_index ? ` · ${defaults.find(i => i.code === update.job?.details.active_index)?.short_name || update.job.details.active_index}` : ""}，行情采集与全历史因子计算可能需要数分钟。`
     : update?.job?.status === "cancelled" ? "同步已停止，已完成的本机数据保留。可点击刷新数据重新同步。"
-    : update?.job?.status === "publish_failed" ? "本机数据已更新，但网页同步失败。线上保留此前结果，可点击刷新数据重试。"
-    : update?.job?.status === "publish_interrupted" ? "本机数据已更新，网页同步任务中断。可点击刷新数据重试。"
+    : update?.job?.status === "publish_failed" ? "本机数据已更新，但网页同步失败。线上保留此前结果，可点击“仅同步网页”重试。"
+    : update?.job?.status === "publish_interrupted" ? "本机数据已更新，网页同步任务中断。可点击“仅同步网页”重试。"
     : publication?.status === "published" ? `本机数据已更新，网页同步成功 · 发布于 ${new Date(publication.published_at!).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}。`
     : publication?.status === "unchanged" ? "本机数据已更新并核对，网页结果已是最新版本，无需重复上传。"
     : update?.job?.status === "completed" ? `本机更新完成${publication?.status === "disabled" ? "（未启用网页自动同步）" : ""}：${update.job.finished_at?.replace("T", " ").slice(0, 19)}。数据日期以各指数显示为准。`
@@ -164,7 +173,7 @@ export default function Page() {
     </div></header>
     <main className="page-shell">
       <div className="breadcrumb">研究工作台 <span>/</span> 宽基指数 <span>/</span> <b>{current.short_name}</b></div>
-      <div className="page-heading"><div><div className="eyebrow">A LONGER VIEW OF THE MARKET</div><h1>用因子，理解市场的脉络<span>。</span></h1><p>从完整历史到当下信号，让每一个判断都有据可循。</p></div><button className="outline-button" onClick={refreshData} disabled={loading || !!syncing}><RefreshCw size={14} className={syncing ? "spin" : ""} />{syncing ? (publishedMode ? "读取中…" : "同步中…") : publishedMode ? "刷新结果" : "刷新数据"}</button></div>
+      <div className="page-heading"><div><div className="eyebrow">A LONGER VIEW OF THE MARKET</div><h1>用因子，理解市场的脉络<span>。</span></h1><p>从完整历史到当下信号，让每一个判断都有据可循。</p></div><div className="refresh-actions">{!publishedMode && <button className="outline-button" onClick={() => refreshData("publish_only")} disabled={loading || !!syncing} title="使用现有本机快照，仅导出并上传网页结果，不重新采集计算">仅同步网页</button>}<button className="outline-button" onClick={() => refreshData()} disabled={loading || !!syncing}><RefreshCw size={14} className={syncing ? "spin" : ""} />{syncing ? (publishedMode ? "读取中…" : "同步中…") : publishedMode ? "刷新结果" : "刷新数据"}</button></div></div>
       {(updateMessage || updateError) && <div className="update-status" role="status" aria-live="polite"><p>{updateError || updateMessage}</p>{!syncing && update?.job?.details.errors?.map((item, i) => <p className="negative" key={i}>{defaults.find(d => d.code === item.index)?.short_name || item.index}：{item.error}</p>)}</div>}
       {!publishedMode && update && <SyncProgress update={update} stopping={stoppingUpdate} onStop={stopSync} />}
       <section className="workspace" aria-label="指数与研究参数">
@@ -184,7 +193,7 @@ export default function Page() {
           <aside className="index-snapshot"><div className="snapshot-top">最新收盘点位<span>PRICE INDEX</span></div><strong className="price-number">{data.assessment.last_price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong><span className={`price-change ${(data.assessment.day_change ?? 0) >= 0 ? "market-up" : "market-down"}`}>{(data.assessment.day_change ?? 0) >= 0 ? <ArrowUpRight size={15} /> : <ArrowDownRight size={15} />}{((data.assessment.day_change ?? 0) * 100).toFixed(2)}%<small>较上一交易日</small></span><Sparkline values={data.prices.slice(-120).map(p => p.close)} /><div className="snapshot-footer"><span>近120个交易日</span><span>价格走势</span></div><p>综合状态为研究性汇总；组合尚未独立验证，不代表收益预测概率。</p></aside>
         </section>
         <div className="data-strip"><span><Database size={14} />{data.coverage.first_date} — {data.coverage.last_date}</span><span><b>{data.coverage.rows.toLocaleString()}</b> 个历史交易日</span><span><b>{activeCount}/{data.factors.length}</b> 个因子有数据</span><span>{data.coverage.cross_source_checked ? <Check size={14} /> : <InfoIcon />}{data.coverage.cross_source_checked ? "价格双源核对" : "单数据源"}</span><button onClick={() => setModal("coverage")}>查看覆盖详情 <ArrowRight size={13} /></button></div>
-        <section className="factor-section"><div className="section-heading"><div><span className="eyebrow">FACTOR EVIDENCE</span><h2>逐个因子，检验每一条线索<span>{data.factors.length}</span></h2><p>当前读数与历史有效性并列呈现。展开卡片，观察走势和预测关系。</p></div><label className="sort-control"><SlidersHorizontal size={14} /><select value={sort} onChange={e => setSort(e.target.value)}><option value="default">研究顺序</option><option value="ic">按样本外 |IC|</option></select></label></div>
+        <section className="factor-section"><div className="section-heading"><div><span className="eyebrow">FACTOR EVIDENCE</span><h2>逐个因子，检验每一条线索<span>{data.factors.length}</span></h2><p>默认按样本外 IC 绝对值从高到低排列，保留正负方向。排序使用顶部所选预测期限，缺失值排在末尾。</p></div><label className="sort-control"><SlidersHorizontal size={14} /><select aria-label="因子排序" value={sort} onChange={e => setSort(e.target.value)}><option value="ic">样本外 |IC| · 从高到低</option><option value="oos_desc">样本外 IC · 从高到低</option><option value="oos_asc">样本外 IC · 从低到高</option><option value="full_desc">全样本 IC · 从高到低</option><option value="full_asc">全样本 IC · 从低到高</option><option value="default">研究顺序</option></select></label></div>
           <div className="category-tabs">{categories.map(c => <button key={c} className={category === c ? "active" : ""} onClick={() => setCategory(c)}>{c}<span>{c === "全部因子" ? data.factors.length : data.factors.filter(f => f.category === c).length}</span></button>)}<button className="collapse-button" onClick={() => setExpanded(new Set())}>收起全部</button></div>
           <div className="factor-list">{factors.map(f => <FactorCard key={`${data.publication_id || data.snapshot_id}-${horizon}-${f.id}`} factor={f} dashboard={data} horizon={horizon} since={since} expanded={expanded.has(f.id)} onToggle={() => setExpanded(s => { const next = new Set(s); next.has(f.id) ? next.delete(f.id) : next.add(f.id); return next; })} />)}</div>
         </section>

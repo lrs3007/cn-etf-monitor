@@ -81,8 +81,18 @@ def current_state(factor_id, value, percentile):
         state = "DIF高于DEA" if value > 0 else "DIF低于DEA" if value < 0 else "DIF与DEA持平"
     elif factor_id == "rsi_14":
         state = "RSI处于70以上的较强动量区" if value >= 70 else "RSI处于30以下的较弱动量区" if value <= 30 else "RSI在30—70之间"
-    elif factor_id in ("volume_ratio_20", "amount_ratio_20"):
+    elif factor_id in ("volume_ratio_20", "amount_ratio_20", "etf_amount_ratio_20"):
         state = "相对前20日均值放大" if value > 1 else "相对前20日均值收缩" if value < 1 else "等于前20日均值"
+    elif factor_id.startswith("etf_shares_change_"):
+        state = "代表ETF份额净增加" if value > 0 else "代表ETF份额净减少" if value < 0 else "代表ETF份额持平"
+    elif factor_id == "etf_premium_discount":
+        state = "收盘价相对同日净值溢价" if value > 0 else "收盘价相对同日净值折价" if value < 0 else "收盘价与净值相等"
+    elif factor_id == "etf_turnover":
+        state = f"代表ETF当日成交份额相当于总份额的{value:.2f}%"
+    elif factor_id == "etf_nav_index_gap_20":
+        state = "净值20日收益高于价格指数" if value > 0 else "净值20日收益低于价格指数" if value < 0 else "净值20日收益与价格指数相等"
+    elif factor_id.startswith("breadth_"):
+        state = ("多数成分股当日上涨" if value > 50 else "不超过半数成分股当日上涨") if factor_id == "breadth_advancing_ratio" else f"{value:.1f}%成分股在各自MA20上方"
     elif factor_id == "drawdown_252":
         state = "处在过去252日最高收盘价" if value == 0 else f"比过去252日最高收盘价低{abs(value):.2f}%"
     elif factor_id == "range_position_252":
@@ -160,7 +170,7 @@ def analyze_factor(dates, close, values, definition, evaluations, launch_date):
         "unit": definition["unit"], "as_of": str(dates[-1]), "current": current, "percentile": position,
         "percentile_samples": len(window_valid), "minimum_samples": minimum,
         "constant_window": bool(len(window_valid) and np.ptp(window_valid) == 0), "match_bounds": bounds,
-        "mechanism": mechanism(definition["id"]), "current_state": current_state(definition["id"], current, position),
+        "mechanism": definition.get("explanation") or mechanism(definition["id"]), "current_state": current_state(definition["id"], current, position),
         "outcomes": outcomes}
 
 

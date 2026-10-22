@@ -21,17 +21,18 @@ export default function FactorCard({ factor, dashboard, horizon, since, expanded
   const [error, setError] = useState("");
   const [diagnostics, setDiagnostics] = useState(false);
   const [chartMode, setChartMode] = useState("separate");
+  useEffect(() => { setResearchHorizon(horizon); }, [horizon]);
   const evaluation = detail?.evaluation ?? factor.evaluation;
   const evidence = dashboard.assessment.evidence.find(e => e.factor_id === factor.id) as Evidence;
   useEffect(() => {
     if (!expanded) return;
     const controller = new AbortController();
     setDetail(null); setError("");
-    readFactor(dashboard.code, factor.id, researchHorizon, dashboard.snapshot_id, controller.signal)
+    readFactor(dashboard.code, factor.id, researchHorizon, dashboard.snapshot_id, controller.signal, dashboard.publication_id)
       .then(d => { if (!controller.signal.aborted) setDetail(d); })
       .catch(e => { if (!controller.signal.aborted) setError(e.message); });
     return () => controller.abort();
-  }, [expanded, dashboard.code, dashboard.snapshot_id, factor.id, researchHorizon]);
+  }, [expanded, dashboard.code, dashboard.snapshot_id, dashboard.publication_id, factor.id, researchHorizon]);
 
   const historyOption = useMemo<EChartsOption>(() => {
     if (!detail) return {};
@@ -123,10 +124,11 @@ export default function FactorCard({ factor, dashboard, horizon, since, expanded
     </button>
     {expanded && <div className="factor-body">
       <div className="factor-description"><Info size={15} /><p>{factor.description}</p><button onClick={download} disabled={!detail} title="导出该因子全部历史"><ArrowDownToLine size={15} /> 导出</button></div>
+      {factor.coverage.source && <div className="research-source"><strong>数据对象：{factor.coverage.source.instrument_name}（{factor.coverage.source.instrument_code}）</strong><p>{factor.coverage.source.note}</p><p>信号对应观测日：{factor.coverage.source.input_observation_date || "当日暂无可用观测"}；已采集最新观测：{factor.coverage.source.latest_observation_date || "尚未取得"}；该观测最早可用日：{factor.coverage.source.earliest_available_date || "—"}。有效历史：{factor.coverage.first_valid || "—"} 至 {factor.coverage.last_valid || "—"}。</p></div>}
       {factor.id === "equity_bond_spread_10y" && <div className="spread-controls"><label>本因子预测期限 <select aria-label="股债收益差预测期限" value={researchHorizon} onChange={e => setResearchHorizon(Number(e.target.value))}>{(factor.horizons || [1, 5, 10, 20, 60]).map(h => <option key={h} value={h}>{h}个交易日</option>)}</select></label><span>5年分位至少756个有效观测；IC检验股票价格指数未来收益。</span></div>}
       {error ? <div className="error-panel">{error}</div> : !detail ? <div className="chart-loading"><LoaderCircle className="spin" size={22} /> 正在读取因子与历史分析…</div> : <>
         <FactorAnalysis analysis={detail.analysis} horizon={researchHorizon} />
-        {!factor.coverage.valid ? <div className="empty-factor"><FlaskConical size={28} /><h4>历史数据尚未接入</h4><p>该因子已注册，全部日期保留缺失状态。可配置 Tushare 或导入含披露日期的历史估值 CSV。</p></div> : <>
+        {!factor.coverage.valid ? <div className="empty-factor"><FlaskConical size={28} /><h4>历史数据尚未接入</h4><p>该因子已注册，全部日期保留缺失状态。{factor.source_group === "breadth" ? "成分股宽度从已验证截面开始累积，也可导入真实历史宽度 CSV；MA20占比需积累20个连续交易日，回测还需足够成熟样本。" : factor.source_group === "etf" ? "等待真实ETF行情、净值或份额数据，上市前及来源缺失区间不回填。" : "可配置 Tushare 或导入含披露日期的历史估值 CSV。"}</p></div> : <>
         {factor.id === "equity_bond_spread_10y" && <SpreadInputs detail={detail} since={since} lastDate={dashboard.coverage.last_date} />}
         <div className="charts-topline"><h4><span className="line-key green" />指数与因子历史走势</h4><div className="mini-segment"><button className={chartMode === "separate" ? "selected" : ""} onClick={() => setChartMode("separate")}>共享时间轴</button><button className={chartMode === "normalized" ? "selected" : ""} onClick={() => setChartMode("normalized")}>标准化叠加</button></div></div>
         <Chart option={historyOption} height={330} label={`${factor.name}与指数的全历史走势图`} />

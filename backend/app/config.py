@@ -46,3 +46,12 @@ INDICES = (
     IndexSpec("000688.SH", "上证科创板50成份指数", "科创50", "sh000688", "1.000688", "2019-12-31", "2020-07-23", "上海市场 · 科技创新"),
 )
 INDEX_MAP = {item.code: item for item in INDICES}
+
+# Representative funds, not an aggregate of every ETF tracking the index.
+ETF_MAP = {
+    "000300.SH": {"code": "510300.SH", "name": "沪深300ETF华泰柏瑞"},
+    "000905.SH": {"code": "510500.SH", "name": "中证500ETF南方"},
+    "000016.SH": {"code": "510050.SH", "name": "上证50ETF华夏"},
+    "399673.SZ": {"code": "159949.SZ", "name": "创业板50ETF华安"},
+    "000688.SH": {"code": "588000.SH", "name": "科创50ETF华夏"},
+}

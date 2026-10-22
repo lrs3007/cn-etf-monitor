@@ -47,20 +47,28 @@ def test_full_history_export_checks_coverage_and_preserves_last_manifest(tmp_pat
         assert hashlib.sha256(raw).hexdigest() == item["sha256"]
         return json.loads(gzip.decompress(raw))
     index = read(f"index/{spec.code}")
-    assert [p["date"] for p in index["prices"]] == dates
-    assert index["returns"]["252"] == [.1, None]
+    prices = [p for name in index["price_chunks"] for p in read(name)["prices"]]
+    assert [p["date"] for p in prices] == dates
+    assert read(index["price_chunks"][0])["returns"]["252"] == [.1, None]
+    pack = read(index["research_chunks"][0])["factors"]
     assert index["evaluations"][SPREAD_FACTOR]["252"]["full_ic"] == .1
-    assert read("factor/s1/momentum_20")["values"] == [[None, "missing_source"], [3, "valid"]]
-    analysis = read("factor/s1/momentum_20")["analysis"]
+    assert pack["momentum_20"]["values"] == [[None, "missing_source"], [3, "valid"]]
+    analysis = index["analyses"]["momentum_20"]
     assert analysis["as_of"] == dates[-1]
     assert analysis["current"] == 3
     assert analysis["percentile"] is None
     assert [o["horizon"] for o in analysis["outcomes"]] == list(HORIZONS)
     assert "没有符合" in analysis["outcomes"][0]["interpretation"]
-    assert [o["horizon"] for o in read(f"factor/s1/{SPREAD_FACTOR}")["analysis"]["outcomes"]] == list(factor_horizons(SPREAD_FACTOR))
+    assert [o["horizon"] for o in index["analyses"][SPREAD_FACTOR]["outcomes"]] == list(factor_horizons(SPREAD_FACTOR))
     assert "SECRET" not in json.dumps(first) + json.dumps(index)
     assert "/private" not in json.dumps(index)
     assert export_results(directory, sessions, (spec,))["export_id"] == first["export_id"]
+    with sessions.begin() as s:
+        s.get(Snapshot, "s1").created_at = "2026-10-20"
+    second = export_results(directory, sessions, (spec,))
+    assert second["export_id"] != first["export_id"]
+    for name in index["price_chunks"] + index["research_chunks"]:
+        assert second["objects"][name] == first["objects"][name]  # release timestamp never invalidates history
     previous = (directory / "manifest.json").read_bytes()
     with sessions.begin() as s:
         s.execute(delete(FactorValue).where(FactorValue.factor_id == "momentum_20", FactorValue.trade_date == dates[0]))

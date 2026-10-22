@@ -22,6 +22,9 @@ class Factor:
     version: int = 1
     assessment_enabled: bool = True
     min_percentile_samples: int = 60
+    source_group: str | None = None
+    purpose: str | None = None
+    explanation: str | None = None
 
     def metadata(self):
         result = {k: v for k, v in asdict(self).items() if k != "compute"}
@@ -30,6 +33,9 @@ class Factor:
         if self.min_percentile_samples == 60:
             result.pop("min_percentile_samples")
         result["horizons"] = factor_horizons(self.id)
+        for key in ("source_group", "purpose", "explanation"):
+            if result[key] is None:
+                result.pop(key)
         return result
 
 
@@ -106,6 +112,31 @@ register(Factor(SPREAD_FACTOR, "股债收益差 · 10年国债", "估值", "百�
     "同一观测日的指数盈利收益率减去中债10年国债到期收益率。保守按下一交易日可用，不填补缺失；数值越高表示按此口径股票相对国债更有吸引力，不代表预期收益。首版不参与综合评分。",
     lambda f: 100 / f.spread_pe_ttm.where(f.spread_pe_ttm > 0) - f.cgb_10y_yield,
     assessment_enabled=False, min_percentile_samples=756))
+
+# External series are calculated on their original observation dates, then made
+# eligible on the next session (or later disclosed date) before reaching here.
+for fid, name, category, unit, formula, explanation, group, purpose in (
+    ("etf_shares_change_5", "ETF · 5日份额变化率", "资金申赎", "%", "(份额_t / 份额_t-5 − 1) × 100",
+     "代表ETF连续6个指数交易日的实际总份额变化，剔除疑似份额折算区间。正值表示净份额增加，负值表示减少；不是二级市场成交额，也不等同现金净流入，不能直接解释为看涨或看跌。", "etf", "收益关联研究"),
+    ("etf_shares_change_20", "ETF · 20日份额变化率", "资金申赎", "%", "(份额_t / 份额_t-20 − 1) × 100",
+     "代表ETF连续21个指数交易日的总份额变化率，观察较长时间的申赎方向；不把零散披露的份额前向填充，不代表同指数全部ETF的资金流。", "etf", "收益关联研究"),
+    ("etf_turnover", "ETF · 日份额换手率", "ETF流动性", "%", "当日成交份额 / 同日总份额 × 100",
+     "代表ETF成交量占其总份额的比例，衡量交易活跃度；同一份额可以反复成交，数值可超过100%。高换手不等于净申购或流动性一定更好，也不代表价格上涨。", "etf", "交易观察"),
+    ("etf_amount_ratio_20", "ETF · 成交额放大倍数", "ETF流动性", "倍", "ETF成交额_t / mean(ETF成交额_t-20:t-1)",
+     "代表ETF当日成交额相对此前20个指数交易日均值的倍数。与现有指数成交额因子分开记录；反映场内活跃度，不是资金净流入，也不能替代买卖价差或冲击成本。", "etf", "收益关联研究"),
+    ("etf_premium_discount", "ETF · 收盘折溢价率", "ETF特征", "%", "(ETF不复权收盘价 / 同日单位净值 − 1) × 100",
+     "同一观测日的代表ETF不复权收盘价相对单位净值的偏离，正值为溢价、负值为折价。净值通常收盘后披露，本项目保守按下一交易日可用；不是盘中IOPV折溢价，折价也不等于底层指数估值便宜。", "etf", "交易观察"),
+    ("etf_nav_index_gap_20", "ETF · 20日净值收益偏离", "ETF特征", "百分点", "[∏(1+ETF披露净值日增长率,20) − 指数close_t/close_t-20] × 100",
+     "代表ETF披露的净值增长率复合收益与对应价格指数20日收益之差。可能包含分红口径、费用、跟踪及数据差异；比较对象是价格指数，因此不称为官方跟踪误差，也不是可直接套利的超额收益。", "etf", "跟踪观察"),
+    ("breadth_advancing_ratio", "成分股 · 上涨家数占比", "市场宽度", "%", "当时成分股上涨家数 / 当时成分股总数 × 100",
+     "只使用对应观测日可确认的指数成分股和同日有效收盘行情，比较上涨股票数量而非市值权重。高于50%表示多数成分股上涨，不保证指数未来上涨；不以今天的成分股重建过去，也不以全市场涨跌家数代替本指数宽度。", "breadth", "收益关联研究"),
+    ("breadth_above_ma20_ratio", "成分股 · MA20上方占比", "市场宽度", "%", "当时成分股中收盘价高于各自20日均线的家数 / 当时成分股总数 × 100",
+     "观察趋势是否由较多成分股参与。仅在当期成分完整、每只成分股均有足够历史收盘数据时计算；新增成分或历史行情不足时明确缺失，高比例不等于行情必然延续。", "breadth", "收益关联研究"),
+):
+    register(Factor(fid, name, category, unit, 1, (fid + "_input",), formula,
+        explanation + " 所有新增因子首版仅作观察，不参与顶部综合评分。",
+        lambda f, column=fid + "_input": f[column], assessment_enabled=False,
+        source_group=group, purpose=purpose, explanation=explanation))
 
 
 def calculate_all(frame):

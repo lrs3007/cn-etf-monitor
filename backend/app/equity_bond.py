@@ -1,6 +1,7 @@
 """Same-observation-day equity/bond inputs, eligible only after publication."""
 import hashlib
 import json
+import time
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 
@@ -79,13 +80,18 @@ def identity(payload):
 def load_bond_history(offline=False, force=False):
     """Year-sized requests cover all local equity history. Closed years are archived."""
     from .providers import ProviderError, archive, fetch
+    from .job_control import report_progress, check_cancelled
     directory = DATA_DIR / "raw" / "CGB10Y"
     observations, records, errors = [], [], []
     today = datetime.now(SHANGHAI).date()
-    for year in range(2002, today.year + 1):
+    def load_year(year):
+        observations, records, errors = [], [], []
+        check_cancelled()
         start, end = f"{year}-01-01", min(date(year, 12, 31), today).isoformat()
         files = sorted(directory.glob(f"chinabond-{year}-*.txt"), key=lambda p: p.stat().st_mtime)
-        replayed = offline or (year < today.year and files and not force)
+        checked = DATA_DIR / "provider-cache" / f"chinabond-{year}.checked"
+        replayed = offline or (year < today.year and files and not force and checked.exists()
+            and time.time() - checked.stat().st_mtime < 7 * 86400)
         print(f"[国债] {year}年 · {'归档重放' if replayed else '在线采集'}", flush=True)
         record = None
         try:
@@ -99,10 +105,13 @@ def load_bond_history(offline=False, force=False):
             rows = parse_yields(text, start, end)
             record = archive("CGB10Y", f"chinabond-{year}", text)
             record["cached"] = bool(replayed)
+            if not replayed:
+                checked.parent.mkdir(parents=True, exist_ok=True)
+                checked.write_text(now_iso())
         except (ProviderError, ValueError) as exc:
             errors.append(f"国债{year}: {exc}")
             if not files:
-                continue
+                return observations, records, errors
             text = files[-1].read_text()
             rows = parse_yields(text, start, end)
             record = archive("CGB10Y", f"chinabond-{year}", text)
@@ -118,6 +127,22 @@ def load_bond_history(offline=False, force=False):
             observations.append({"id": identity(payload), "series_id": SERIES_ID,
                 "observation_date": row["date"], "available_date": row["available_date"], "value": row["value"],
                 "provenance": {**record, "availability_assumed": True}})
+        return observations, records, errors
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from contextvars import copy_context
+    years = list(range(2002, today.year + 1))
+    grouped = {}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="bond-year") as executor:
+        pending = {executor.submit(copy_context().run, load_year, year): year for year in years}
+        for future in as_completed(pending):
+            check_cancelled()
+            year = pending[future]
+            grouped[year] = future.result()
+            report_progress("collect_bonds", f"中债10年期：已核对{year}年", len(grouped), len(years), "个年份")
+    for year in years:
+        obs, refs, issues = grouped[year]
+        observations.extend(obs); records.extend(refs); errors.extend(issues)
     return {"observations": observations, "source_records": records, "errors": errors}
 
 
@@ -140,7 +165,7 @@ def align_spread_inputs(frame, valuations, bond_context, index_code, valuation_r
         if available < day:
             raise ProviderError("PE可用日期早于观测日期")
         source = row.get("source", "valuation_import")
-        raw = [r for r in valuation_records if r.get("source") == source]
+        raw = [row["raw_record"]] if isinstance(row.get("raw_record"), dict) else [r for r in valuation_records if r.get("source") == source]
         provenance = {"source": source, "raw_records": raw,
             "availability_assumed": row.get("availability_assumed", True), "raw_sha256": row.get("raw_sha256")}
         payload = {"index_code": index_code, "observation_date": day,
